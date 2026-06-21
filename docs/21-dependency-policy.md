@@ -79,6 +79,32 @@ Native web delivery (Kelompok A) adds **no** system library: the built-in web
 server serves built web assets (markup, stylesheets, client scripts, and static
 files) using the standard library only — no embedded engine is linked.
 
+### Native codegen (Phase D — AOT)
+
+The native AOT backend (`ran build --native`) invokes the **system C compiler**
+(`cc`, or `$CC` if set) at build time to compile generated C and link a
+precompiled C runtime (`libran_rt`) into a real native binary. This is a
+**build-time-only** dependency in the same documented-exception class as the
+OpenSSL/SQLite FFI above:
+
+| Tool | Use | Invoked by | Verification |
+|------|-----|------------|--------------|
+| System C compiler (`cc`/`$CC`, e.g. gcc or clang) | Compile + link native AOT output | `backend/aot` (spawns `cc`) at `ran build --native` time | Presence checked before use (`E0601` if missing); compile/link failures surface as `E0603`/`E0604` |
+
+Rationale and scope:
+
+- **No cargo crate is added.** The dependency manifest stays empty; the only
+  addition is spawning the host's C toolchain, which every developer machine
+  building native software already has.
+- **Build-time only.** The C compiler is not required to *run* a native binary,
+  only to produce one. The emitted artifact carries no embedded interpreter and
+  no `.ran` source.
+- **Honest subset.** Constructs outside the supported native subset are a hard
+  build error (`E0606`), never a silent fallback — so a native build either
+  produces a fully native binary or fails with a clear diagnostic.
+- The default `ran build` (without `--native`) still uses the std-only
+  embed-source path and spawns no compiler.
+
 ### Linking mode
 
 By default the system library above is **dynamically linked** (the build emits

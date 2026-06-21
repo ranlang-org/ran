@@ -349,7 +349,8 @@ pub struct CodeInfo {
 /// Runtime Capabilities and memory-safe-self-hosting features, grouped by
 /// capability range: `E02xx` ownership/borrow, `E04xx` penyajian web native,
 /// `E05xx` SQLite/`db` plus the poisoned-mutex recovery code (`E0511`),
-/// `E06xx` concurrency, `E07xx` resource-aware build, and the Phase A crash
+/// `E06xx` native AOT codegen (`E0601`–`E0606`) and concurrency
+/// (`E0610`–`E0614`), `E07xx` resource-aware build, and the Phase A crash
 /// hardening faults `E10xx` (recursion guard `E1007`, bounded VM `E1008`/`E1009`,
 /// checked arithmetic `E1010`/`E1011`, bounds-safe indexing `E1012`, and the
 /// recoverable library-code assertion fault `E1013`).
@@ -470,6 +471,50 @@ pub const DIAGNOSTIC_CATALOG: &[CodeInfo] = &[
         severity: Severity::Error,
         handleable: false,
         hint: "Tidak ada transaksi aktif. Panggil `db.begin` sebelum commit/rollback.",
+    },
+    // -- Phase D: Native AOT codegen (E06xx, 0601–0606) ------------------------
+    CodeInfo {
+        // R10.6: no system C compiler available for the native build pipeline.
+        code: "E0601",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Tidak ada kompiler C (`cc`/`$CC`). Pasang gcc/clang atau set `$CC` ke path-nya.",
+    },
+    CodeInfo {
+        // R10.6: lowering the checked program to C source failed.
+        code: "E0602",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Emit kode C gagal. Tambahkan anotasi tipe, atau build tanpa `--native` untuk memakai binary berbasis interpreter.",
+    },
+    CodeInfo {
+        // R10.6: the system C compiler rejected the generated source.
+        code: "E0603",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Kompilasi C gagal (lihat keluaran `cc`). Ini bug codegen — laporkan.",
+    },
+    CodeInfo {
+        // R10.6: linking the native binary against the Ran runtime failed.
+        code: "E0604",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Penautan (link) binary native gagal (lihat keluaran `cc`). Ini bug codegen — laporkan.",
+    },
+    CodeInfo {
+        // R10.5: `--link-static` requested but a required static library is missing.
+        code: "E0605",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Pustaka statik yang dibutuhkan `--link-static` tidak ditemukan. Pasang arsip `.a`-nya atau tautkan dinamis.",
+    },
+    CodeInfo {
+        // R10.1: a construct outside the supported native subset; a hard build
+        // error — native codegen never silently falls back to the interpreter.
+        code: "E0606",
+        severity: Severity::Error,
+        handleable: false,
+        hint: "Konstruksi ini di luar subset native saat ini. Build tanpa `--native`, atau tunggu iterasi native berikutnya (D2+).",
     },
     // -- Kelompok C: Concurrency runtime (E06xx) -------------------------------
     CodeInfo {
@@ -626,6 +671,8 @@ mod catalog_tests {
             // SQLite/db
             "E0501", "E0502", "E0503", "E0504", "E0505", "E0506", "E0507", "E0508",
             "E0509", "E0510",
+            // Phase D native AOT codegen
+            "E0601", "E0602", "E0603", "E0604", "E0605", "E0606",
             // concurrency
             "E0610", "E0611", "E0612", "E0613", "E0614",
             // build

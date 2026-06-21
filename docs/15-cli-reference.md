@@ -236,7 +236,7 @@ directly, without wrapping them in `main()`.
 
 ```bash
 ran repl
-# Ran REPL v0.2.1
+# Ran REPL v0.2.2
 # Type expressions or statements. Type 'exit' or Ctrl+D to quit.
 ```
 
@@ -268,7 +268,7 @@ Print version and tagline.
 
 ```bash
 ran version
-# ran v0.2.1
+# ran v0.2.2
 # The Ran Programming Language
 # A self-hosted language for internal systems and business tooling.
 # Engine: tree-walking interpreter

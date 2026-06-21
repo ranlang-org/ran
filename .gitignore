@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Native AOT codegen scratch (ran build --native writes ./build/<name>.c + objects)
+/build/
+
 # Ran build dumps + compiled example binaries (ran build --debug writes ./debug/*.txt)
 examples/**/target/
 examples/**/debug/

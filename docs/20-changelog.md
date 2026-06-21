@@ -1,12 +1,13 @@
 # Changelog
 
-## Unreleased — Memory-safe self-hosting (Phases A–C complete)
+## 0.2.2 — Memory-safe self-hosting (Phases A–C) + native AOT codegen (D1–D2)
 
 Tracked under the `memory-safe-self-hosting` effort. **Phases A, B, and C are
-complete and verified** (full suite green: 372 tests — 331 unit + 41
-integration/golden — plus property-based tests P1–P20). **Phase D (native AOT
-codegen) is designed but not yet started.** A condensed summary also lives in the
-root [`CHANGELOG.md`](../CHANGELOG.md).
+complete**, and **native AOT codegen iterations D1–D2 shipped** — `ran build
+--native` now emits real native ELF binaries for a growing subset. Backward
+compatible (native is additive; default `ran build` unchanged). Verified: 382
+tests green. A condensed summary also lives in the root
+[`CHANGELOG.md`](../CHANGELOG.md).
 
 ### Phase A — memory safety & crash hardening (first-class priority)
 
@@ -61,15 +62,30 @@ root [`CHANGELOG.md`](../CHANGELOG.md).
 - Bounded execution + output buffering keep the VM safe and fallback output correct.
 - A regression gate keeps the full suite green before the VM became the default.
 
-### Phase D — native AOT codegen (designed, not started)
+### Phase D — native AOT codegen (D1–D2 shipped)
 
-A real AOT backend: lower checked programs to C → link against a precompiled
-`libran_rt` runtime/stdlib → emit true ELF machine code (no embedded interpreter,
-no `.ran` source in the artifact). Stdlib is **linked**, not re-emitted (Go/Rust
-model); hot numeric code is unboxed to native `int64`/`double`. Unsupported
-constructs are a hard build error (`E06xx`), never a silent fallback. Full design in
-[16 - Roadmap](16-roadmap.md). Phases E–G (compiler stdlib, Ran-in-Ran compiler,
-bootstrap fixed point) follow.
+`ran build --native` (alias `--aot`) emits a real native ELF binary: lower the
+checked program to C → link a precompiled C runtime (`libran_rt`) → invoke the
+system `cc`. **No embedded interpreter, no `.ran` source** in the artifact;
+output is **byte-for-byte identical to the interpreter** and runs under `env -i`.
+Default `ran build` is unchanged (still embed-source) so nothing regresses.
+
+- **D1** (scalar core): functions+recursion, `if`/`while`/`for range`,
+  `break`/`continue`, checked int arithmetic (`E1010`/`E1011`), bool+comparisons,
+  strings+concat, `echo` interpolation; proven numeric values unboxed to native
+  `int64`/`bool`.
+- **D2** (data-type layer): tagged, reference-counted `RanValue` (no leak /
+  double-free) backing **exact `decimal` money math**, `float`, **arrays** +
+  bounds-checked indexing (`E1012`) + `len`, **structs** (literal + field access),
+  and **`match`**.
+- No fake native / no silent fallback: out-of-subset constructs are a hard
+  `E0606` build error; atomic temp→rename means no partial artifact. New build
+  diagnostics `E0601`–`E0606`; the system C compiler is a documented build-time
+  dependency-policy exception (no cargo crate added).
+- **Remaining (D3+):** general string interpolation, closures, trait dispatch,
+  `spawn`/channels, stdlib via `libran_rt`, `--link-static`, then making native
+  the default. Phases E–G (compiler stdlib, Ran-in-Ran compiler, bootstrap fixed
+  point) follow.
 
 ## 0.2.1 — bytecode target, faster runtime, build dumps
 

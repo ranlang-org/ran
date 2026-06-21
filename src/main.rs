@@ -662,7 +662,20 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     // `--debug`: emit the full artifact dump (./debug/) and a detailed,
     // per-stage build log. Without it, the build is concise with a live spinner.
     let debug = args.iter().any(|a| a == "--debug");
-    let args: Vec<String> = args.iter().filter(|a| *a != "--debug").cloned().collect();
+    // `--native` (alias `--aot`): route to the real native AOT codegen backend
+    // (emit C -> system `cc` -> native ELF). This is additive: the DEFAULT
+    // `ran build` path stays the embed-source `compile_standalone` so existing
+    // behavior and the full test suite are unchanged (the design switches the
+    // default only after the native subset matures).
+    let native = args.iter().any(|a| a == "--native" || a == "--aot");
+    let link_static = args.iter().any(|a| a == "--link-static");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            *a != "--debug" && *a != "--native" && *a != "--aot" && *a != "--link-static"
+        })
+        .cloned()
+        .collect();
     let args = &args[..];
 
     // Resolve entry: explicit arg, else project detection.
@@ -877,13 +890,37 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     }
 
     // ---- Phase 6: link the standalone binary ----
-    build_stage(debug, start, "Finishing", "linking standalone binary (runtime + embedded program)");
-    // Live compile animation only around the slow linking phase — all the
-    // abort-prone phases (parse/analyze) already ran above with no spinner, so
-    // their diagnostics print cleanly.
-    let mut spinner = if debug { None } else { Spinner::start(&proj) };
-    let success = codegen::compile_standalone(&merged_source, &output);
-    if let Some(s) = spinner.take() { s.stop(); }
+    let mut spinner;
+    let success;
+    if native {
+        // Real native AOT codegen: emit C, compile + link with the system C
+        // compiler, produce a genuine native ELF with NO embedded interpreter
+        // and NO `.ran` source. Out-of-subset constructs are a hard E0606 error
+        // (never a silent interpreter fallback).
+        build_stage(debug, start, "Finishing", "native codegen (emit C → cc → link)");
+        spinner = if debug { None } else { Spinner::start(&proj) };
+        let opts = backend::aot::AotOptions { file: filename.clone(), link_static };
+        match backend::aot::compile_native(&checked, &output, &opts) {
+            Ok(()) => {
+                if let Some(s) = spinner.take() { s.stop(); }
+                success = true;
+            }
+            Err(diag) => {
+                if let Some(s) = spinner.take() { s.stop(); }
+                diag.emit(&source);
+                build_mgr.finish();
+                process::exit(1);
+            }
+        }
+    } else {
+        build_stage(debug, start, "Finishing", "linking standalone binary (runtime + embedded program)");
+        // Live compile animation only around the slow linking phase — all the
+        // abort-prone phases (parse/analyze) already ran above with no spinner, so
+        // their diagnostics print cleanly.
+        spinner = if debug { None } else { Spinner::start(&proj) };
+        success = codegen::compile_standalone(&merged_source, &output);
+        if let Some(s) = spinner.take() { s.stop(); }
+    }
     if !success {
         build_mgr.finish(); // release build-management state (R18.5)
         process::exit(1);
@@ -913,6 +950,11 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     println!(
         "  \x1b[36m▸ Standalone\x1b[0m runs on another machine with no `ran` install"
     );
+    if native {
+        println!(
+            "  \x1b[32;1m▸ Native\x1b[0m true native binary — no embedded interpreter, no `.ran` source inside"
+        );
+    }
     if !used.is_empty() {
         println!(
             "        \x1b[33mNote\x1b[0m uses {} — the target also needs the matching system library (TLS/SQLite) unless statically linked",
@@ -1150,7 +1192,7 @@ Thumbs.db
 }
 
 fn cmd_repl() {
-    println!("Ran REPL v0.2.1");
+    println!("Ran REPL v0.2.2");
     println!("Type expressions or statements. Type 'exit' or Ctrl+D to quit.");
     println!();
 
@@ -1241,14 +1283,14 @@ fn cmd_repl() {
 }
 
 fn cmd_version() {
-    println!("ran v0.2.1");
+    println!("ran v0.2.2");
     println!("The Ran Programming Language");
     println!("A self-hosted language for internal systems and business tooling.");
     println!("Engine: bytecode VM (default) with tree-walking interpreter fallback");
 }
 
 fn print_usage() {
-    println!("Ran Programming Language v0.2.1");
+    println!("Ran Programming Language v0.2.2");
     println!();
     println!("Usage:");
     println!("  ran <file.ran>          Run a .ran file");
