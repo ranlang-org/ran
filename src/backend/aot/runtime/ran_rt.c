@@ -26,6 +26,10 @@
 /* Abort with a Ran-style diagnostic and exit code 70 (the interpreter's
  * top-level fault exit code). */
 static void ran_fault(const char *code, const char *message, const char *help) {
+    /* Flush buffered stdout first so any already-echoed output appears before
+     * the diagnostic, matching the interpreter's ordering when both streams are
+     * captured together. */
+    fflush(stdout);
     fprintf(stderr, "error[%s]: %s\n", code, message);
     fprintf(stderr, "  = help: %s\n", help);
     exit(70);
@@ -245,11 +249,23 @@ struct RanObject {
     RanValue *vals;               /* owned (n slots) */
 };
 
+/* String-keyed dictionary. Entries are kept in INSERTION order (a parallel
+ * keys/vals array); the interpreter's HashMap leaves order unspecified, so
+ * whole-map traversal here is order-divergent but per-key access matches. */
+struct RanMap {
+    _Atomic long rc;
+    size_t len;
+    size_t cap;
+    char    **keys;   /* owned, NUL-terminated copies */
+    RanValue *vals;   /* owned */
+};
+
 void ran_retain(RanValue v) {
     switch (v.tag) {
         case RAN_STR:    atomic_fetch_add(&v.u.s->rc, 1); break;
         case RAN_ARRAY:  atomic_fetch_add(&v.u.a->rc, 1); break;
         case RAN_OBJECT: atomic_fetch_add(&v.u.o->rc, 1); break;
+        case RAN_MAP:    atomic_fetch_add(&v.u.m->rc, 1); break;
         default: break;
     }
 }
@@ -274,6 +290,17 @@ void ran_release(RanValue v) {
                 for (size_t i = 0; i < v.u.o->n; i++) ran_release(v.u.o->vals[i]);
                 free(v.u.o->vals);
                 free(v.u.o);
+            }
+            break;
+        case RAN_MAP:
+            if (atomic_fetch_sub(&v.u.m->rc, 1) == 1) {
+                for (size_t i = 0; i < v.u.m->len; i++) {
+                    free(v.u.m->keys[i]);
+                    ran_release(v.u.m->vals[i]);
+                }
+                free(v.u.m->keys);
+                free(v.u.m->vals);
+                free(v.u.m);
             }
             break;
         default:
@@ -640,6 +667,93 @@ RanValue ran_field(RanValue obj, const char *name) {
     return ran_void();
 }
 
+/* ====================================================================== */
+/* Maps (string-keyed dictionary; mirrors the interpreter's Value::Map).  */
+/* Entries are kept in insertion order; the interpreter uses a HashMap, so */
+/* iteration/display order is unspecified in BOTH engines — only per-key   */
+/* access is deterministic (see ran_rt.h note).                            */
+/* ====================================================================== */
+
+RanValue ran_map_new(void) {
+    RanMap *p = (RanMap *)ran_xalloc(sizeof(RanMap));
+    atomic_store(&p->rc, 1);
+    p->len = 0;
+    p->cap = 0;
+    p->keys = NULL;
+    p->vals = NULL;
+    RanValue v; v.tag = RAN_MAP; v.u.m = p;
+    return v;
+}
+
+/* Find the slot index of `key`, or -1 if absent. */
+static long ran_map_find(RanMap *p, const char *key) {
+    for (size_t i = 0; i < p->len; i++) {
+        if (strcmp(p->keys[i], key) == 0) return (long)i;
+    }
+    return -1;
+}
+
+static char *ran_strdup(const char *s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *out = (char *)ran_xalloc(n + 1);
+    memcpy(out, s, n + 1);
+    return out;
+}
+
+void ran_map_set(RanValue map, const char *key, RanValue val) {
+    if (map.tag != RAN_MAP) { ran_release(val); return; }
+    RanMap *p = map.u.m;
+    long idx = ran_map_find(p, key);
+    if (idx >= 0) {
+        /* Overwrite: release the previous value, take ownership of the new. */
+        ran_release(p->vals[idx]);
+        p->vals[idx] = val;
+        return;
+    }
+    if (p->len == p->cap) {
+        size_t ncap = p->cap ? p->cap * 2 : 4;
+        char **nk = (char **)ran_xalloc(ncap * sizeof(char *));
+        RanValue *nv = (RanValue *)ran_xalloc(ncap * sizeof(RanValue));
+        if (p->keys) { memcpy(nk, p->keys, p->len * sizeof(char *)); free(p->keys); }
+        if (p->vals) { memcpy(nv, p->vals, p->len * sizeof(RanValue)); free(p->vals); }
+        p->keys = nk;
+        p->vals = nv;
+        p->cap = ncap;
+    }
+    p->keys[p->len] = ran_strdup(key); /* key copied */
+    p->vals[p->len] = val;             /* ownership taken */
+    p->len++;
+}
+
+RanValue ran_map_get(RanValue map, const char *key) {
+    if (map.tag != RAN_MAP) return ran_void();
+    RanMap *p = map.u.m;
+    long idx = ran_map_find(p, key);
+    if (idx < 0) return ran_void();
+    return ran_clone(p->vals[idx]);
+}
+
+RanValue ran_map_keys(RanValue map) {
+    RanValue arr = ran_array_new(map.tag == RAN_MAP ? map.u.m->len : 0);
+    if (map.tag == RAN_MAP) {
+        for (size_t i = 0; i < map.u.m->len; i++) {
+            ran_array_push(arr, ran_from_str(map.u.m->keys[i]));
+        }
+    }
+    return arr;
+}
+
+RanValue ran_map_values(RanValue map) {
+    RanValue arr = ran_array_new(map.tag == RAN_MAP ? map.u.m->len : 0);
+    if (map.tag == RAN_MAP) {
+        for (size_t i = 0; i < map.u.m->len; i++) {
+            ran_array_push(arr, ran_clone(map.u.m->vals[i]));
+        }
+    }
+    return arr;
+}
+
 /* String-interpolation dotted-path resolution (mirrors the interpreter's
  * `lookup_path` + the "unknown name left literal" fallback in
  * `interpolate_string`). `base` is borrowed (never released here). `fields` is
@@ -835,6 +949,9 @@ bool ran_truthy(RanValue v) {
         case RAN_STR:   return v.u.s->len != 0;
         case RAN_ARRAY: return v.u.a->len != 0;
         case RAN_VOID:  return false;
+        /* RAN_MAP / RAN_OBJECT fall through to the default: the interpreter's
+         * `is_truthy_val` returns `true` for a map/object regardless of size
+         * (its `_ => true` arm), so an empty map is STILL truthy. */
         default:        return true;
     }
 }
@@ -843,6 +960,7 @@ int64_t ran_len(RanValue v) {
     switch (v.tag) {
         case RAN_STR:   return (int64_t)v.u.s->len;
         case RAN_ARRAY: return (int64_t)v.u.a->len;
+        case RAN_MAP:   return (int64_t)v.u.m->len;
         default:        return 0;
     }
 }
@@ -893,6 +1011,22 @@ const char *ran_value_to_str(RanValue v) {
                 sb_push(&b, v.u.o->names[k]);
                 sb_push(&b, ": ");
                 sb_push(&b, ran_value_to_str(v.u.o->vals[k]));
+            }
+            sb_push(&b, "}");
+            return b.buf;
+        }
+        case RAN_MAP: {
+            /* Mirrors `Value::Map` Display: {"k": v, ...}. ORDER is insertion
+             * order here vs HashMap order in the interpreter — not byte-for-byte
+             * comparable on the whole-map form (verify via per-key access). */
+            SB b; sb_init(&b);
+            sb_push(&b, "{");
+            for (size_t k = 0; k < v.u.m->len; k++) {
+                if (k) sb_push(&b, ", ");
+                sb_push(&b, "\"");
+                sb_push(&b, v.u.m->keys[k]);
+                sb_push(&b, "\": ");
+                sb_push(&b, ran_value_to_str(v.u.m->vals[k]));
             }
             sb_push(&b, "}");
             return b.buf;
@@ -1756,6 +1890,19 @@ static void json_encode_into(SB *b, RanValue v) {
             sb_push(b, "}");
             break;
         }
+        case RAN_MAP: {
+            /* Matches Value::Map to_json: {"k":v,...}. Key ORDER is insertion
+             * order (interpreter: HashMap order) — see ran_rt.h note. */
+            sb_push(b, "{");
+            for (size_t i = 0; i < v.u.m->len; i++) {
+                if (i) sb_push(b, ",");
+                json_escape_into(b, v.u.m->keys[i]);
+                sb_push(b, ":");
+                json_encode_into(b, v.u.m->vals[i]);
+            }
+            sb_push(b, "}");
+            break;
+        }
     }
 }
 
@@ -1801,6 +1948,21 @@ static void json_pretty_into(SB *b, RanValue v, int indent) {
         sb_push(b, "}");
         return;
     }
+    if (v.tag == RAN_MAP) {
+        if (v.u.m->len == 0) { sb_push(b, "{}"); return; }
+        sb_push(b, "{\n");
+        for (size_t i = 0; i < v.u.m->len; i++) {
+            if (i) sb_push(b, ",\n");
+            sb_indent(b, indent + 1);
+            json_escape_into(b, v.u.m->keys[i]);
+            sb_push(b, ": ");
+            json_pretty_into(b, v.u.m->vals[i], indent + 1);
+        }
+        sb_push(b, "\n");
+        sb_indent(b, indent);
+        sb_push(b, "}");
+        return;
+    }
     json_encode_into(b, v);
 }
 
@@ -1808,4 +1970,545 @@ const char *ran_mod_json_pretty(const RanValue *argv, int64_t argc) {
     SB b; sb_init(&b);
     json_pretty_into(&b, marg_val(argv, argc, 0), 0);
     return b.buf;
+}
+
+/* ====================================================================== */
+/* json.decode / parse / get / valid — byte-faithful mirror of the        */
+/* interpreter's recursive-descent parser in runtime/json.rs.             */
+/*                                                                        */
+/* The interpreter scans a Vec<char> (Unicode scalars); this scans bytes. */
+/* For ASCII JSON the two are identical; string CONTENT bytes (incl.      */
+/* multi-byte UTF-8) are copied verbatim, and `\uXXXX` escapes are        */
+/* re-encoded to UTF-8 (with surrogate-pair joining) so decoded strings   */
+/* match the interpreter byte-for-byte for deterministic inputs. Objects  */
+/* decode to RAN_MAP, arrays to RAN_ARRAY, numbers to RAN_INT|RAN_FLOAT,  */
+/* booleans to RAN_BOOL, strings to RAN_STR, and null to RAN_VOID — the   */
+/* exact value shapes `parse_json` produces.                              */
+/* ====================================================================== */
+
+static bool jp_is_ws(unsigned char c) {
+    /* Rust char::is_whitespace for the bytes JSON can contain: the ASCII
+     * whitespace set (space, tab, LF, VT, FF, CR). */
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static void jp_skip_ws(const char *s, size_t len, size_t *pos) {
+    while (*pos < len && jp_is_ws((unsigned char)s[*pos])) (*pos)++;
+}
+
+/* Append a Unicode code point to `b` as UTF-8 (mirrors pushing a `char`). */
+static void utf8_encode_into(SB *b, unsigned int cp) {
+    char tmp[5];
+    if (cp < 0x80) {
+        tmp[0] = (char)cp; tmp[1] = '\0';
+    } else if (cp < 0x800) {
+        tmp[0] = (char)(0xC0 | (cp >> 6));
+        tmp[1] = (char)(0x80 | (cp & 0x3F));
+        tmp[2] = '\0';
+    } else if (cp < 0x10000) {
+        tmp[0] = (char)(0xE0 | (cp >> 12));
+        tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[2] = (char)(0x80 | (cp & 0x3F));
+        tmp[3] = '\0';
+    } else {
+        tmp[0] = (char)(0xF0 | (cp >> 18));
+        tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[3] = (char)(0x80 | (cp & 0x3F));
+        tmp[4] = '\0';
+    }
+    sb_push(b, tmp);
+}
+
+/* Read 4 hex digits following a `\u` (pos is ON the 'u'); on success advances
+ * pos to the last hex digit and returns the code unit, else returns -1. */
+static long jp_read_hex4(const char *s, size_t len, size_t *pos) {
+    if (*pos + 4 >= len) return -1;
+    unsigned int val = 0;
+    for (int k = 1; k <= 4; k++) {
+        char c = s[*pos + k];
+        unsigned int d;
+        if (c >= '0' && c <= '9') d = (unsigned int)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned int)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned int)(c - 'A' + 10);
+        else return -1;
+        val = val * 16 + d;
+    }
+    *pos += 4;
+    return (long)val;
+}
+
+/* Parse a JSON string starting at the opening quote; returns a heap copy. */
+static char *jp_string(const char *s, size_t len, size_t *pos) {
+    SB b; sb_init(&b);
+    (*pos)++; /* opening quote */
+    while (*pos < len && s[*pos] != '"') {
+        if (s[*pos] == '\\' && *pos + 1 < len) {
+            (*pos)++;
+            char e = s[*pos];
+            switch (e) {
+                case 'n': sb_push(&b, "\n"); break;
+                case 't': sb_push(&b, "\t"); break;
+                case 'r': sb_push(&b, "\r"); break;
+                case 'b': sb_push(&b, "\b"); break;
+                case 'f': sb_push(&b, "\f"); break;
+                case '"': sb_push(&b, "\""); break;
+                case '\\': sb_push(&b, "\\"); break;
+                case '/': sb_push(&b, "/"); break;
+                case 'u': {
+                    long cp = jp_read_hex4(s, len, pos);
+                    if (cp >= 0) {
+                        if (cp >= 0xD800 && cp <= 0xDBFF
+                            && *pos + 2 < len
+                            && s[*pos + 1] == '\\' && s[*pos + 2] == 'u') {
+                            *pos += 2; /* onto the second 'u' */
+                            long lo = jp_read_hex4(s, len, pos);
+                            if (lo >= 0) {
+                                unsigned int c = 0x10000u
+                                    + (((unsigned int)cp - 0xD800u) << 10)
+                                    + ((unsigned int)lo - 0xDC00u);
+                                utf8_encode_into(&b, c);
+                            }
+                        } else {
+                            utf8_encode_into(&b, (unsigned int)cp);
+                        }
+                    }
+                    break;
+                }
+                default: {
+                    char one[2] = { e, '\0' };
+                    sb_push(&b, one);
+                    break;
+                }
+            }
+        } else {
+            char one[2] = { s[*pos], '\0' };
+            sb_push(&b, one);
+        }
+        (*pos)++;
+    }
+    (*pos)++; /* closing quote */
+    return b.buf;
+}
+
+static RanValue jp_value(const char *s, size_t len, size_t *pos);
+
+static RanValue jp_number(const char *s, size_t len, size_t *pos) {
+    size_t start = *pos;
+    bool is_float = false;
+    while (*pos < len) {
+        char c = s[*pos];
+        if ((c >= '0' && c <= '9') || c == '-' || c == '+') {
+            (*pos)++;
+        } else if (c == '.' || c == 'e' || c == 'E') {
+            is_float = true;
+            (*pos)++;
+        } else {
+            break;
+        }
+    }
+    size_t n = *pos - start;
+    char *buf = (char *)ran_xalloc(n + 1);
+    memcpy(buf, s + start, n);
+    buf[n] = '\0';
+    RanValue v;
+    if (is_float) {
+        /* `num.parse::<f64>().unwrap_or(0.0)`: the whole text must parse. */
+        char *end = NULL;
+        double d = strtod(buf, &end);
+        v = ran_from_float((end && *end == '\0' && end != buf) ? d : 0.0);
+    } else {
+        /* `num.parse::<i64>().unwrap_or(0)`: the whole text must parse. */
+        char *end = NULL;
+        long long ll = strtoll(buf, &end, 10);
+        v = ran_from_int((end && *end == '\0' && end != buf) ? (int64_t)ll : 0);
+    }
+    free(buf);
+    return v;
+}
+
+static RanValue jp_bool(const char *s, size_t len, size_t *pos) {
+    if (s[*pos] == 't') {
+        if (*pos + 4 <= len && strncmp(s + *pos, "true", 4) == 0) { *pos += 4; return ran_from_bool(true); }
+        (*pos)++; return ran_from_bool(true);
+    } else {
+        if (*pos + 5 <= len && strncmp(s + *pos, "false", 5) == 0) { *pos += 5; return ran_from_bool(false); }
+        (*pos)++; return ran_from_bool(false);
+    }
+}
+
+static RanValue jp_array(const char *s, size_t len, size_t *pos) {
+    RanValue arr = ran_array_new(4);
+    (*pos)++; /* '[' */
+    for (;;) {
+        jp_skip_ws(s, len, pos);
+        if (*pos >= len || s[*pos] == ']') { (*pos)++; break; }
+        ran_array_push(arr, jp_value(s, len, pos));
+        jp_skip_ws(s, len, pos);
+        if (*pos < len && s[*pos] == ',') (*pos)++;
+    }
+    return arr;
+}
+
+static RanValue jp_object(const char *s, size_t len, size_t *pos) {
+    RanValue map = ran_map_new();
+    (*pos)++; /* '{' */
+    for (;;) {
+        jp_skip_ws(s, len, pos);
+        if (*pos >= len || s[*pos] == '}') { (*pos)++; break; }
+        if (s[*pos] != '"') break; /* malformed key -> stop (matches interpreter) */
+        char *key = jp_string(s, len, pos);
+        jp_skip_ws(s, len, pos);
+        if (*pos < len && s[*pos] == ':') (*pos)++;
+        RanValue val = jp_value(s, len, pos);
+        ran_map_set(map, key, val); /* key copied; val ownership taken */
+        free(key);
+        jp_skip_ws(s, len, pos);
+        if (*pos < len && s[*pos] == ',') (*pos)++;
+    }
+    return map;
+}
+
+static RanValue jp_value(const char *s, size_t len, size_t *pos) {
+    jp_skip_ws(s, len, pos);
+    if (*pos >= len) return ran_void();
+    switch (s[*pos]) {
+        case '{': return jp_object(s, len, pos);
+        case '[': return jp_array(s, len, pos);
+        case '"': { char *str = jp_string(s, len, pos); RanValue v = ran_from_str(str); free(str); return v; }
+        case 't':
+        case 'f': return jp_bool(s, len, pos);
+        case 'n':
+            if (*pos + 4 <= len && strncmp(s + *pos, "null", 4) == 0) { *pos += 4; return ran_void(); }
+            (*pos)++; return ran_void();
+        default: return jp_number(s, len, pos);
+    }
+}
+
+static RanValue ran_parse_json(const char *s) {
+    if (!s) s = "";
+    size_t len = strlen(s);
+    size_t pos = 0;
+    return jp_value(s, len, &pos);
+}
+
+RanValue ran_mod_json_decode(const RanValue *argv, int64_t argc) {
+    return ran_parse_json(marg_str(argv, argc, 0, ""));
+}
+RanValue ran_mod_json_parse(const RanValue *argv, int64_t argc) {
+    return ran_parse_json(marg_str(argv, argc, 0, ""));
+}
+
+bool ran_mod_json_valid(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    if (!s) s = "";
+    /* trim() empty check (matches `s.trim().is_empty()`). */
+    const char *a = s;
+    const char *z = s + strlen(s);
+    while (a < z && jp_is_ws((unsigned char)*a)) a++;
+    while (z > a && jp_is_ws((unsigned char)z[-1])) z--;
+    if (a == z) return false;
+
+    size_t len = strlen(s);
+    size_t pos = 0;
+    jp_skip_ws(s, len, &pos);
+    size_t start = pos;
+    RanValue v = jp_value(s, len, &pos);
+    ran_release(v);
+    if (pos <= start) return false;
+    jp_skip_ws(s, len, &pos);
+    return pos >= len;
+}
+
+/* json.get(value_or_json_string, "a.b.0"): a Str base is parsed first, then a
+ * dotted path is walked (named segments index map/object, numeric segments
+ * index arrays). Mirrors json_path_get; returns RAN_VOID for any missing step.
+ * BORROWS argv; returns an owned value. */
+RanValue ran_mod_json_get(const RanValue *argv, int64_t argc) {
+    RanValue base = marg_val(argv, argc, 0);
+    RanValue cur;
+    if (base.tag == RAN_STR) {
+        cur = ran_parse_json(base.u.s->data); /* owned */
+    } else {
+        cur = ran_clone(base);                /* owned copy of the borrowed arg */
+    }
+    const char *path = marg_str(argv, argc, 1, "");
+    if (!path || path[0] == '\0') return cur;
+
+    const char *p = path;
+    while (*p) {
+        const char *seg_start = p;
+        while (*p && *p != '.') p++;
+        size_t seg_len = (size_t)(p - seg_start);
+        char *seg = (char *)ran_xalloc(seg_len + 1);
+        memcpy(seg, seg_start, seg_len);
+        seg[seg_len] = '\0';
+
+        RanValue next;
+        if (cur.tag == RAN_MAP) {
+            next = ran_map_get(cur, seg);
+        } else if (cur.tag == RAN_OBJECT) {
+            next = ran_field(cur, seg);
+        } else if (cur.tag == RAN_ARRAY) {
+            /* numeric segment only (Rust `seg.parse::<usize>()`); else void. */
+            char *end = NULL;
+            unsigned long long idx = strtoull(seg, &end, 10);
+            if (end && *end == '\0' && end != seg) {
+                next = (idx < cur.u.a->len) ? ran_clone(cur.u.a->items[idx]) : ran_void();
+            } else {
+                free(seg);
+                ran_release(cur);
+                return ran_void();
+            }
+        } else {
+            free(seg);
+            ran_release(cur);
+            return ran_void();
+        }
+        free(seg);
+        ran_release(cur);
+        cur = next;
+        if (*p == '.') p++;
+    }
+    return cur;
+}
+
+/* ====================================================================== */
+/* env — environment + dotenv (D4b-1). Deterministic given the process    */
+/* environment. Mirrors the interpreter's `env` module in module_dispatch */
+/* (env.get/get_or/require/has/set/unset/int/float/bool/decimal/all) and  */
+/* the dotenv loader (env.load/load_override/load_default).               */
+/* ====================================================================== */
+
+extern char **environ;
+
+/* parse_env_bool: true/1/yes/on/y -> true; false/0/no/off/n/"" -> false;
+ * anything else -> "no decision" (returns false, sets *ok=false). */
+static bool env_parse_bool(const char *s, bool *ok) {
+    /* trim + lowercase into a small stack buffer. */
+    char buf[32];
+    const char *a = s ? s : "";
+    const char *z = a + strlen(a);
+    while (a < z && (*a==' '||*a=='\t'||*a=='\n'||*a=='\r'||*a=='\f'||*a=='\v')) a++;
+    while (z > a && (z[-1]==' '||z[-1]=='\t'||z[-1]=='\n'||z[-1]=='\r'||z[-1]=='\f'||z[-1]=='\v')) z--;
+    size_t n = (size_t)(z - a);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    for (size_t i = 0; i < n; i++) {
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        buf[i] = c;
+    }
+    buf[n] = '\0';
+    *ok = true;
+    if (!strcmp(buf,"true")||!strcmp(buf,"1")||!strcmp(buf,"yes")||!strcmp(buf,"on")||!strcmp(buf,"y")) return true;
+    if (!strcmp(buf,"false")||!strcmp(buf,"0")||!strcmp(buf,"no")||!strcmp(buf,"off")||!strcmp(buf,"n")||buf[0]=='\0') return false;
+    *ok = false;
+    return false;
+}
+
+RanValue ran_mod_env_get(const RanValue *argv, int64_t argc) {
+    const char *v = getenv(marg_str(argv, argc, 0, ""));
+    return v ? ran_from_str(v) : ran_void();
+}
+
+const char *ran_mod_env_get_or(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *def = marg_str(argv, argc, 1, "");
+    const char *v = getenv(key);
+    return dup_str(v ? v : def);
+}
+
+const char *ran_mod_env_require(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *v = getenv(key);
+    if (!v) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "required environment variable `%s` is not set", key);
+        ran_fault("E1005", msg, "set it in the environment or in a .env file (env.load)");
+    }
+    return dup_str(v);
+}
+
+bool ran_mod_env_has(const RanValue *argv, int64_t argc) {
+    return getenv(marg_str(argv, argc, 0, "")) != NULL;
+}
+
+bool ran_mod_env_set(const RanValue *argv, int64_t argc) {
+    setenv(marg_str(argv, argc, 0, ""), marg_str(argv, argc, 1, ""), 1);
+    return true;
+}
+
+bool ran_mod_env_unset(const RanValue *argv, int64_t argc) {
+    unsetenv(marg_str(argv, argc, 0, ""));
+    return true;
+}
+
+int64_t ran_mod_env_int(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    int64_t def = marg_int(argv, argc, 1, 0);
+    const char *v = getenv(key);
+    if (!v) return def;
+    /* `v.trim().parse::<i64>().unwrap_or(def)` — whole trimmed text must parse. */
+    const char *a = v; const char *z = v + strlen(v);
+    while (a < z && (*a==' '||*a=='\t'||*a=='\n'||*a=='\r'||*a=='\f'||*a=='\v')) a++;
+    while (z > a && (z[-1]==' '||z[-1]=='\t'||z[-1]=='\n'||z[-1]=='\r'||z[-1]=='\f'||z[-1]=='\v')) z--;
+    size_t n = (size_t)(z - a);
+    char *buf = (char *)ran_xalloc(n + 1);
+    memcpy(buf, a, n); buf[n] = '\0';
+    char *end = NULL;
+    long long ll = strtoll(buf, &end, 10);
+    int64_t out = (end && *end == '\0' && end != buf) ? (int64_t)ll : def;
+    free(buf);
+    return out;
+}
+
+double ran_mod_env_float(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    double def = marg_f64(argv, argc, 1);
+    const char *v = getenv(key);
+    if (!v) return def;
+    const char *a = v; const char *z = v + strlen(v);
+    while (a < z && (*a==' '||*a=='\t'||*a=='\n'||*a=='\r'||*a=='\f'||*a=='\v')) a++;
+    while (z > a && (z[-1]==' '||z[-1]=='\t'||z[-1]=='\n'||z[-1]=='\r'||z[-1]=='\f'||z[-1]=='\v')) z--;
+    size_t n = (size_t)(z - a);
+    char *buf = (char *)ran_xalloc(n + 1);
+    memcpy(buf, a, n); buf[n] = '\0';
+    char *end = NULL;
+    double d = strtod(buf, &end);
+    double out = (end && *end == '\0' && end != buf) ? d : def;
+    free(buf);
+    return out;
+}
+
+bool ran_mod_env_bool(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    bool def = ran_truthy(marg_val(argv, argc, 1));
+    const char *v = getenv(key);
+    if (!v) return def;
+    bool ok = false;
+    bool parsed = env_parse_bool(v, &ok);
+    return ok ? parsed : def;
+}
+
+RanValue ran_mod_env_decimal(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *def = marg_str(argv, argc, 1, "0");
+    const char *v = getenv(key);
+    const char *raw = v ? v : def;
+    Dec d;
+    if (dec_parse_str(raw, &d)) return dec_value(d.mant, d.scale);
+    if (dec_parse_str(def, &d)) return dec_value(d.mant, d.scale);
+    return dec_value(0, 0);
+}
+
+RanValue ran_mod_env_all(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    RanValue map = ran_map_new();
+    if (environ) {
+        for (char **e = environ; *e; e++) {
+            const char *entry = *e;
+            const char *eq = strchr(entry, '=');
+            if (!eq) continue;
+            size_t klen = (size_t)(eq - entry);
+            char *key = (char *)ran_xalloc(klen + 1);
+            memcpy(key, entry, klen); key[klen] = '\0';
+            ran_map_set(map, key, ran_from_str(eq + 1));
+            free(key);
+        }
+    }
+    return map;
+}
+
+/* dotenv loader: KEY=value / export KEY=value, '#' comments, blank lines, and
+ * single/double-quoted values; trailing " #" inline comments stripped on
+ * unquoted values. Returns the count of variables set. When !override, existing
+ * process variables are left untouched. Mirrors `load_dotenv`. */
+static int64_t env_load_dotenv(const char *path, bool override_existing) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0; /* missing file is not an error */
+    /* Slurp the whole file. */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return 0; }
+    rewind(f);
+    char *text = (char *)ran_xalloc((size_t)size + 1);
+    size_t got = fread(text, 1, (size_t)size, f);
+    text[got] = '\0';
+    fclose(f);
+
+    int64_t count = 0;
+    char *save = text;
+    char *line;
+    /* Iterate lines (split on '\n'; tolerate '\r'). */
+    while ((line = save) != NULL) {
+        char *nl = strchr(save, '\n');
+        if (nl) { *nl = '\0'; save = nl + 1; } else { save = NULL; }
+        /* trim line */
+        char *a = line;
+        char *z = line + strlen(line);
+        while (a < z && (*a==' '||*a=='\t'||*a=='\r'||*a=='\f'||*a=='\v')) a++;
+        while (z > a && (z[-1]==' '||z[-1]=='\t'||z[-1]=='\r'||z[-1]=='\f'||z[-1]=='\v')) z--;
+        *z = '\0';
+        if (*a == '\0' || *a == '#') continue;
+        if (strncmp(a, "export ", 7) == 0) {
+            a += 7;
+            while (*a==' '||*a=='\t') a++;
+        }
+        char *eq = strchr(a, '=');
+        if (!eq) continue;
+        /* key = trim(a..eq), val = trim(eq+1..) */
+        char *ka = a, *kz = eq;
+        while (ka < kz && (*ka==' '||*ka=='\t')) ka++;
+        while (kz > ka && (kz[-1]==' '||kz[-1]=='\t')) kz--;
+        if (ka == kz) continue;
+        char *va = eq + 1, *vz = a + strlen(a);
+        while (va < vz && (*va==' '||*va=='\t')) va++;
+        while (vz > va && (vz[-1]==' '||vz[-1]=='\t')) vz--;
+
+        size_t klen = (size_t)(kz - ka);
+        char *key = (char *)ran_xalloc(klen + 1);
+        memcpy(key, ka, klen); key[klen] = '\0';
+
+        size_t vlen = (size_t)(vz - va);
+        char *val;
+        if (vlen >= 2 && ((va[0]=='"' && vz[-1]=='"') || (va[0]=='\'' && vz[-1]=='\''))) {
+            /* strip surrounding matching quotes */
+            size_t inner = vlen - 2;
+            val = (char *)ran_xalloc(inner + 1);
+            memcpy(val, va + 1, inner); val[inner] = '\0';
+        } else {
+            /* trim trailing inline comment " #" on unquoted values */
+            char *cut = NULL;
+            for (char *p = va; p + 1 < vz; p++) {
+                if (p[0] == ' ' && p[1] == '#') { cut = p; break; }
+            }
+            char *vend = cut ? cut : vz;
+            while (vend > va && (vend[-1]==' '||vend[-1]=='\t')) vend--;
+            size_t n = (size_t)(vend - va);
+            val = (char *)ran_xalloc(n + 1);
+            memcpy(val, va, n); val[n] = '\0';
+        }
+
+        if (!override_existing && getenv(key) != NULL) {
+            free(key); free(val);
+            continue;
+        }
+        setenv(key, val, 1);
+        count++;
+        free(key);
+        free(val);
+    }
+    free(text);
+    return count;
+}
+
+int64_t ran_mod_env_load(const RanValue *argv, int64_t argc) {
+    return env_load_dotenv(marg_str(argv, argc, 0, ".env"), false);
+}
+int64_t ran_mod_env_load_override(const RanValue *argv, int64_t argc) {
+    return env_load_dotenv(marg_str(argv, argc, 0, ".env"), true);
+}
+int64_t ran_mod_env_load_default(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return env_load_dotenv(".env", false);
 }

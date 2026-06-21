@@ -15,6 +15,7 @@
  *     Ran decimal -> RanValue (RAN_DEC, inline i128 mantissa+scale, POD)
  *     Ran array   -> RanValue (RAN_ARRAY, reference-counted heap payload)
  *     Ran struct  -> RanValue (RAN_OBJECT, reference-counted heap payload)
+ *     Ran map     -> RanValue (RAN_MAP, reference-counted heap payload; D4b-1)
  *
  * Memory model: heap payloads (string/array/object) carry an *atomic* reference
  * count. `ran_retain`/`ran_release` adjust it; releasing the last reference
@@ -81,13 +82,15 @@ typedef enum {
     RAN_DEC,
     RAN_STR,
     RAN_ARRAY,
-    RAN_OBJECT
+    RAN_OBJECT,
+    RAN_MAP
 } RanTag;
 
 typedef struct RanValue  RanValue;
 typedef struct RanStr    RanStr;
 typedef struct RanArray  RanArray;
 typedef struct RanObject RanObject;
+typedef struct RanMap    RanMap;
 
 struct RanValue {
     RanTag tag;
@@ -99,6 +102,7 @@ struct RanValue {
         RanStr   *s;   /* RAN_STR    */
         RanArray *a;   /* RAN_ARRAY  */
         RanObject *o;  /* RAN_OBJECT */
+        RanMap   *m;   /* RAN_MAP    */
     } u;
 };
 
@@ -147,6 +151,27 @@ RanValue ran_object_new(const char *type_name, size_t n, const char *const *name
 void     ran_object_set(RanValue obj, size_t idx, RanValue val);
 /* Field access by name. Returns an owned (+1) copy; missing field -> void. */
 RanValue ran_field(RanValue obj, const char *name);
+
+/* ---- Maps (string-keyed, reference-counted). -------------------------- */
+/* The native map mirrors the interpreter's `Value::Map` (a string->value
+ * dictionary). NOTE on ORDER: the interpreter stores maps in a Rust `HashMap`,
+ * whose iteration order is unspecified/nondeterministic. This native map keeps
+ * entries in INSERTION order, so whole-map display (`ran_value_to_str`),
+ * `ran_map_keys`/`ran_map_values`, and `json.encode` of a map are NOT
+ * guaranteed byte-for-byte equal to the interpreter (both engines leave order
+ * unspecified). Per-key access (`ran_map_get`, `m["k"]`) IS deterministic and
+ * matches the interpreter exactly. */
+RanValue ran_map_new(void);
+/* Insert/overwrite `key` (copied) with `val` (ownership taken, NOT retained).
+ * Overwriting an existing key releases the previous value. */
+void     ran_map_set(RanValue map, const char *key, RanValue val);
+/* Lookup by key. Returns an owned (+1) copy; a missing key -> RAN_VOID (to
+ * match the interpreter's `m.get(k).cloned().unwrap_or(Void)`). */
+RanValue ran_map_get(RanValue map, const char *key);
+/* The keys as a fresh RAN_ARRAY of RAN_STR (insertion order — see note). */
+RanValue ran_map_keys(RanValue map);
+/* The values as a fresh RAN_ARRAY of owned copies (insertion order). */
+RanValue ran_map_values(RanValue map);
 
 /* String-interpolation dotted-path resolution. Walks the dot-separated `fields`
  * remainder (e.g. "owner", "address.city") starting from `base` (borrowed). On
@@ -276,5 +301,29 @@ bool    ran_mod_rand_bool(const RanValue *argv, int64_t argc);
 const char *ran_mod_json_encode(const RanValue *argv, int64_t argc);
 const char *ran_mod_json_stringify(const RanValue *argv, int64_t argc);
 const char *ran_mod_json_pretty(const RanValue *argv, int64_t argc);
+/* json decode/parse (alias): JSON text -> RanValue (object->map, array->array,
+ * number->int|float, bool, string, null->void) matching the interpreter's
+ * `parse_json` exactly for deterministic inputs. `get` walks a dotted path
+ * (`"a.b.0"`); `valid` is the strict single-value validator. */
+RanValue    ran_mod_json_decode(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_json_parse(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_json_get(const RanValue *argv, int64_t argc);
+bool        ran_mod_json_valid(const RanValue *argv, int64_t argc);
+
+/* env — environment + dotenv (D4b-1). Deterministic given the process env. */
+RanValue    ran_mod_env_get(const RanValue *argv, int64_t argc);        /* str | void */
+const char *ran_mod_env_get_or(const RanValue *argv, int64_t argc);
+const char *ran_mod_env_require(const RanValue *argv, int64_t argc);    /* missing -> E1005 */
+bool        ran_mod_env_has(const RanValue *argv, int64_t argc);
+bool        ran_mod_env_set(const RanValue *argv, int64_t argc);
+bool        ran_mod_env_unset(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_env_int(const RanValue *argv, int64_t argc);
+double      ran_mod_env_float(const RanValue *argv, int64_t argc);
+bool        ran_mod_env_bool(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_env_decimal(const RanValue *argv, int64_t argc);    /* decimal */
+RanValue    ran_mod_env_all(const RanValue *argv, int64_t argc);        /* map */
+int64_t     ran_mod_env_load(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_env_load_override(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_env_load_default(const RanValue *argv, int64_t argc);
 
 #endif /* RAN_RT_H */

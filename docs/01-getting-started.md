@@ -145,7 +145,7 @@ For quick experiments, start the interactive REPL:
 
 ```bash
 ran repl
-# Ran REPL v0.2.3
+# Ran REPL v0.2.4
 # Type expressions or statements. Type 'exit' or Ctrl+D to quit.
 ```
 

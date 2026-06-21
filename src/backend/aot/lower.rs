@@ -80,11 +80,12 @@ fn real_module_name(path: &str) -> String {
     path.strip_prefix("std::").unwrap_or(path).to_string()
 }
 
-/// The stdlib modules bridged into native code in D4a. Heavier modules
-/// (`http`, `db`, `web`, `concurrency`, `crypto`, `decimal`-as-module, `env`)
-/// remain a hard E0606 until D4b.
+/// The stdlib modules bridged into native code. D4a added time/log/math/str/
+/// os/fs/rand/json(encode side); D4b-1 completes `json` (decode/parse/get/valid)
+/// and adds `env` (environment + dotenv). Heavier modules (`http`, `db`, `web`,
+/// `concurrency`, `crypto`, `decimal`-as-module) remain a hard E0606.
 fn is_bridged_module(m: &str) -> bool {
-    matches!(m, "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json")
+    matches!(m, "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json" | "env")
 }
 
 /// Collect import alias -> module name for every `import` in the program
@@ -163,9 +164,21 @@ fn bridged_method_ret(module: &str, method: &str) -> Option<Option<CType>> {
         ("rand", "float") => Some(Float),
         ("rand", "bool") => Some(Bool),
 
-        // --- json (encode/pretty are deterministic; decode/parse/get/valid
-        //     remain E0606 — the native value model has no map type yet) ---
+        // --- json (encode/pretty are deterministic; decode/parse/get build
+        //     native values via the RAN_MAP model added in D4b-1) ---
         ("json", "encode") | ("json", "stringify") | ("json", "pretty") => Some(Str),
+        ("json", "decode") | ("json", "parse") | ("json", "get") => Some(Value),
+        ("json", "valid") => Some(Bool),
+
+        // --- env (environment + dotenv; deterministic given the process env) ---
+        ("env", "get") => Some(Value),       // str | void
+        ("env", "get_or") | ("env", "require") => Some(Str),
+        ("env", "has") | ("env", "set") | ("env", "unset") | ("env", "bool") => Some(Bool),
+        ("env", "int") => Some(Int),
+        ("env", "float") => Some(Float),
+        ("env", "decimal") => Some(Value),   // decimal
+        ("env", "all") => Some(Value),       // map
+        ("env", "load") | ("env", "load_override") | ("env", "load_default") => Some(Int),
 
         _ => return None,
     };
@@ -248,10 +261,11 @@ fn unsupported(file: &str, span_line: usize, span_col: usize, what: &str) -> Dia
             span_col.max(1) + 1,
         ))
         .with_help(
-            "this construct is outside the D2 native subset (functions, control flow, \
-             int/float/bool/str, decimal, arrays, structs, match); build without \
-             `--native` to use the interpreter-backed binary, or wait for a later \
-             native iteration (D3+)",
+            "this construct is outside the native subset (functions, control flow, \
+             int/float/bool/str, decimal, arrays, structs, maps, match, and the \
+             bridged stdlib modules time/log/math/str/os/fs/rand/json/env); build \
+             without `--native` to use the interpreter-backed binary, or wait for a \
+             later native iteration",
         )
 }
 
@@ -378,7 +392,10 @@ fn collect_structs(checked: &CheckedProgram) -> StructDefs {
 }
 
 fn is_builtin_call(name: &str) -> bool {
-    matches!(name, "dec" | "decimal" | "len")
+    matches!(
+        name,
+        "dec" | "decimal" | "len" | "map" | "set" | "get" | "keys" | "values"
+    )
 }
 
 fn check_block(body: &[Stmt], file: &str, fns: &[String], structs: &StructDefs, mods: &ModAliases) -> Result<(), Diagnostic> {
@@ -691,6 +708,10 @@ fn infer_expr(
                 match name.as_str() {
                     "len" => Ok(CType::Int),
                     "dec" | "decimal" => Ok(CType::Value),
+                    // Map surface: map() builds a map; get/keys/values yield a
+                    // value; set mutates in place and yields void (modeled as a
+                    // RAN_VOID Value temporary so it routes through emit_value).
+                    "map" | "get" | "keys" | "values" | "set" => Ok(CType::Value),
                     _ => match sigs.get(name) {
                         Some(sig) => sig
                             .ret
@@ -1376,11 +1397,20 @@ impl<'a> Emit<'a> {
             Expression::Index { object, index } => {
                 let arrt = self.emit_value(object, depth)?;
                 let (idxcode, idxty) = self.emit_scalar(index, depth)?;
-                if idxty != CType::Int {
-                    return Err(codegen_err(self.file, 0, 0, "array index must be an integer"));
-                }
                 let t = self.fresh_t();
-                self.line(depth, &format!("RanValue {} = ran_index({}, {});", t, arrt, idxcode));
+                match idxty {
+                    // A string key indexes a map (`m["k"]` -> ran_map_get,
+                    // owned copy or void for a missing key, matching the
+                    // interpreter's `(Map, Str)` arm).
+                    CType::Str => {
+                        self.line(depth, &format!("RanValue {} = ran_map_get({}, {});", t, arrt, idxcode));
+                    }
+                    // An integer key indexes an array (bounds-checked E1012).
+                    CType::Int => {
+                        self.line(depth, &format!("RanValue {} = ran_index({}, {});", t, arrt, idxcode));
+                    }
+                    _ => return Err(codegen_err(self.file, 0, 0, "index must be an integer (array) or string (map)")),
+                }
                 Ok(t)
             }
             Expression::FieldAccess { object, field } => {
@@ -1440,6 +1470,9 @@ impl<'a> Emit<'a> {
                 };
                 if name == "dec" || name == "decimal" {
                     return self.emit_dec_call(args, depth);
+                }
+                if matches!(name.as_str(), "map" | "set" | "get" | "keys" | "values") {
+                    return self.emit_map_builtin(&name, args, depth);
                 }
                 let sig = self
                     .sigs
@@ -1513,6 +1546,92 @@ impl<'a> Emit<'a> {
         };
         self.line(depth, &format!("RanValue {} = {};", t, init));
         Ok(t)
+    }
+
+    /// Render an expression as a `const char*` C expression (used for map keys,
+    /// matching the interpreter's `eval_arg_str`: a string is used directly, any
+    /// other value is rendered via its Display form).
+    fn emit_key_cstr(&mut self, expr: &Expression, depth: usize) -> Result<String, Diagnostic> {
+        let ty = self.infer(expr)?;
+        if ty == CType::Value {
+            let t = self.emit_value(expr, depth)?;
+            Ok(format!("ran_value_to_str({})", t))
+        } else {
+            let (code, sty) = self.emit_scalar(expr, depth)?;
+            Ok(to_cstr(&code, sty))
+        }
+    }
+
+    /// Lower the map surface that mirrors the interpreter's builtins:
+    ///   * `map()`            -> a fresh empty RAN_MAP;
+    ///   * `set(m, k, v)`     -> in-place insert/overwrite (yields void);
+    ///   * `get(m, k)`        -> owned value or void for a missing key;
+    ///   * `keys(m)/values(m)`-> a fresh array (insertion order — see ran_rt.h).
+    ///
+    /// `set` requires its first argument to be a variable so the mutation is
+    /// visible afterwards, exactly like the interpreter (`var_get_mut`); a
+    /// non-variable target is a no-op there, and we reject it here as a codegen
+    /// error rather than silently dropping the write.
+    fn emit_map_builtin(
+        &mut self,
+        name: &str,
+        args: &[Expression],
+        depth: usize,
+    ) -> Result<String, Diagnostic> {
+        match name {
+            "map" => {
+                let t = self.fresh_t();
+                self.line(depth, &format!("RanValue {} = ran_map_new();", t));
+                Ok(t)
+            }
+            "set" => {
+                if args.len() < 3 {
+                    return Err(codegen_err(self.file, 0, 0, "set(map, key, value) needs three arguments"));
+                }
+                let map_var = match &args[0] {
+                    Expression::Variable(n) => c_ident(n),
+                    _ => {
+                        return Err(codegen_err(
+                            self.file,
+                            0,
+                            0,
+                            "set(...)'s first argument must be a map variable",
+                        ))
+                    }
+                };
+                let key = self.emit_key_cstr(&args[1], depth)?;
+                let val = self.emit_value(&args[2], depth)?;
+                // The map takes its OWN reference to the value (ran_clone); the
+                // emitted temporary is released by the statement's cleanup.
+                self.line(depth, &format!("ran_map_set({}, {}, ran_clone({}));", map_var, key, val));
+                let t = self.fresh_t();
+                self.line(depth, &format!("RanValue {} = ran_void();", t));
+                Ok(t)
+            }
+            "get" => {
+                if args.len() < 2 {
+                    return Err(codegen_err(self.file, 0, 0, "get(map, key) needs two arguments"));
+                }
+                let m = self.emit_value(&args[0], depth)?;
+                let key = self.emit_key_cstr(&args[1], depth)?;
+                let t = self.fresh_t();
+                self.line(depth, &format!("RanValue {} = ran_map_get({}, {});", t, m, key));
+                Ok(t)
+            }
+            "keys" | "values" => {
+                let m = match args.first() {
+                    Some(a) => self.emit_value(a, depth)?,
+                    None => {
+                        return Err(codegen_err(self.file, 0, 0, &format!("{}(map) needs an argument", name)))
+                    }
+                };
+                let helper = if name == "keys" { "ran_map_keys" } else { "ran_map_values" };
+                let t = self.fresh_t();
+                self.line(depth, &format!("RanValue {} = {}({});", t, helper, m));
+                Ok(t)
+            }
+            _ => unreachable!(),
+        }
     }
 
     // -- Condition emission: returns a C bool expression (may create temps). --
@@ -2063,16 +2182,29 @@ fn main() {
     // ---- D2 reject: still-out-of-subset constructs are hard E0606. ---------
 
     #[test]
-    fn supported_rejects_maps() {
+    fn supported_accepts_maps() {
+        // D4b-1: the map surface (constructor + get/set/keys/values + index)
+        // is now inside the native subset.
         let src = r#"
 fn main() {
     let m = map()
-    echo "x"
+    set(m, "a", 1)
+    set(m, "b", 2)
+    let v = get(m, "a")
+    echo v
+    echo m["b"]
+    echo len(m)
+    let ks = keys(m)
+    echo len(ks)
 }
 "#;
         let checked = check(src);
-        let err = supported(&checked, "test.ran").expect_err("map builtin must be rejected");
-        assert_eq!(err.code.as_deref(), Some("E0606"));
+        supported(&checked, "test.ran").expect("the map surface is in the D4b-1 subset");
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("ran_map_new()"), "map constructor:\n{c}");
+        assert!(c.contains("ran_map_set(r_m,"), "map set in place:\n{c}");
+        assert!(c.contains("ran_map_get("), "map get / index:\n{c}");
+        assert!(c.contains("ran_map_keys("), "map keys:\n{c}");
     }
 
     #[test]
@@ -2173,18 +2305,46 @@ fn main() {
     }
 
     #[test]
-    fn supported_rejects_non_bridged_module_method() {
-        // A method call on a bridged alias but an unbridged method is E0606.
+    fn supported_accepts_json_decode_and_env() {
+        // D4b-1: json.decode/parse/get/valid and the env module are bridged.
         let src = r#"
 import "std::json" as json
+import "std::env" as env
 fn main() {
-    let v = json.decode("[]")
+    let v = json.decode("{\"a\": 1}")
+    echo json.get(v, "a")
+    let ok = json.valid("[1,2,3]")
+    echo ok
+    env.set("RAN_X", "42")
+    echo env.get("RAN_X")
+    echo env.int("RAN_X", 0)
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").expect("json.decode + env are in the D4b-1 subset");
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("ran_mod_json_decode("), "json.decode lowered:\n{c}");
+        assert!(c.contains("ran_mod_json_get("), "json.get lowered:\n{c}");
+        assert!(c.contains("ran_mod_json_valid("), "json.valid lowered:\n{c}");
+        assert!(c.contains("ran_mod_env_set("), "env.set lowered:\n{c}");
+        assert!(c.contains("ran_mod_env_get("), "env.get lowered:\n{c}");
+        assert!(c.contains("ran_mod_env_int("), "env.int lowered:\n{c}");
+    }
+
+    #[test]
+    fn supported_rejects_non_bridged_module_method() {
+        // A method call on a bridged alias but an unbridged method is E0606.
+        // (`os.tmpdir` is not in the bridged set.)
+        let src = r#"
+import "std::os" as os
+fn main() {
+    let v = os.tmpdir()
     echo "x"
 }
 "#;
         let checked = check(src);
         let err = supported(&checked, "test.ran")
-            .expect_err("json.decode is not bridged in D4a");
+            .expect_err("os.tmpdir is not bridged");
         assert_eq!(err.code.as_deref(), Some("E0606"));
     }
 

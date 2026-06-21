@@ -25,6 +25,43 @@ Next: native AOT D4b — a native map/dict value type (unlocking `json.decode`/`
 native the default once the subset matures. Phases E–G (compiler stdlib, the
 Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0) follow.
 
+## [Unreleased]
+
+Next: native AOT D4b-2/3 — `concurrency` (`spawn`/channels via pthreads) and
+`crypto`, then the I/O-heavy `http` (server + TLS client) and `db` (SQLite) modules
+linked into native binaries; `--link-static`; making native the default once the
+subset matures. Phases E–G (compiler stdlib, the Ran-in-Ran compiler `ranc`, and
+the bootstrap fixed point that defines 1.0.0) follow.
+
+## [0.2.4] — Native map type, JSON decode & env (D4b-1)
+
+Backward-compatible. The native AOT runtime gained a reference-counted **map/dict
+type**, which unlocks `json.decode`/`parse`/`get` and the `env` module in native
+builds — the foundational data layer the rest of the stdlib bridge builds on.
+Verified: 392 tests green; default `ran build` unchanged.
+
+### Added — native map/dict (`RanValue` RAN_MAP)
+
+- Reference-counted, string-keyed map payload (no leak / double-free, verified with
+  ASan/UBSan). Native lowering for `map()`, `m["key"]`, `set`/`get`/`keys`/`values`,
+  and `len` on maps. Per-key access is byte-for-byte identical to the interpreter;
+  whole-map *display order* is insertion order (the interpreter's is a hash order) —
+  a documented, value-preserving divergence.
+
+### Added — native `json` decode + `env`
+
+- `json.decode`/`json.parse`/`json.get("a.b.0")`/`json.valid` — a byte-faithful port
+  of the interpreter's JSON parser (objects→map, arrays→array, numbers, bool, string
+  with `\uXXXX` + surrogate pairs, null).
+- The `env` module: `get/get_or/require/int/float/bool/decimal/has/set/unset/all`
+  plus dotenv `load/load_override/load_default`, matching the interpreter
+  (`env.require` missing → `E1005`; `env.all` returns a map).
+
+### Still a hard `E0606` (deferred)
+
+- `http`, `db`, `web`, `concurrency`, `crypto`, `decimal` module-form; `os.meminfo`
+  (needs a native sysinfo probe). Never a silent fallback.
+
 ## [0.2.3] — Native string interpolation + stdlib bridge (D3/D4a)
 
 Backward-compatible. The native AOT path (`ran build --native`) gained general

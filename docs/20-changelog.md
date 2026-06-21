@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.4 — Native map type, JSON decode & env (D4b-1)
+
+Backward-compatible. The native AOT runtime gained a reference-counted **map/dict
+type**, unlocking `json.decode`/`parse`/`get` and the `env` module in `ran build
+--native`. Verified: 392 tests green; default `ran build` unchanged. Summary in the
+root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Native map/dict (`RAN_MAP`):** refcounted, string-keyed (ASan/UBSan clean).
+  Lowering for `map()`, `m["key"]`, `set`/`get`/`keys`/`values`, `len`. Per-key
+  access is byte-for-byte equal to the interpreter; whole-map display order is
+  insertion order (documented value-preserving divergence).
+- **Native `json` decode:** `json.decode`/`parse`/`get("a.b.0")`/`valid` — a faithful
+  port of the interpreter's parser (objects→map, arrays→array, numbers/bool/string
+  with `\uXXXX`+surrogates/null).
+- **Native `env`:** `get/get_or/require/int/float/bool/decimal/has/set/unset/all` +
+  dotenv `load/load_override/load_default` (`env.require` missing → `E1005`).
+- **Still `E0606`:** `http`, `db`, `web`, `concurrency`, `crypto`, `decimal`
+  module-form, `os.meminfo`. Never a silent fallback.
+
 ## 0.2.3 — Native string interpolation + stdlib bridge (D3 / D4a)
 
 Backward-compatible. `ran build --native` gained **general string interpolation**
