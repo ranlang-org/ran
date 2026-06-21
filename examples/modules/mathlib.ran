@@ -1,0 +1,9 @@
+# mathlib.ran - a reusable module
+
+pub fn square(n: int) -> int {
+    return n * n
+}
+
+pub fn cube(n: int) -> int {
+    return n * n * n
+}

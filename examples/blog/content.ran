@@ -1,0 +1,54 @@
+# content.ran — blog post data (seed content).
+#
+# The DATA layer. In a real app this could come from the `db` module (SQLite);
+# here it is kept in code so the example runs with no setup. These functions are
+# the single source of post data.
+
+# Shape one post as a map. Used by all_posts().
+fn post(slug, title, date, summary, body) {
+    let m = map()
+    set(m, "slug", slug)
+    set(m, "title", title)
+    set(m, "date", date)
+    set(m, "summary", summary)
+    set(m, "body", body)
+    return m
+}
+
+# Every post, newest first.
+fn all_posts() {
+    return [
+        post(
+            "clean-structure",
+            "A Clean Project Structure",
+            "2026-06-18",
+            "URLs mirror the file paths under public/, so every file's location is obvious.",
+            "In Ran, the public/ folder is the web root. A file at public/assets/css/blog.css is served at the URL /assets/css/blog.css. This one-to-one mapping keeps file locations predictable."
+        ),
+        post(
+            "native-web",
+            "Serving the Web Natively",
+            "2026-06-10",
+            "The web module serves HTML, CSS, and client assets straight from one folder.",
+            "The web module picks the content type from the file extension, sends cache validators, and coexists with dynamic routes. Pages are assembled on the server through one shared layout function."
+        ),
+        post(
+            "hello-ran",
+            "Hello, Ran",
+            "2026-06-01",
+            "The first post: why this blog is built with Ran.",
+            "Welcome. This blog is built entirely with Ran: server-side routes, a shared layout, and tidy static assets. No external framework is installed."
+        )
+    ]
+}
+
+# Find a post by slug. Returns an empty map when none matches.
+fn find_post(slug) {
+    let posts = all_posts()
+    for p in posts {
+        if p["slug"] == slug {
+            return p
+        }
+    }
+    return map()
+}

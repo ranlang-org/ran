@@ -1,0 +1,22 @@
+#!/usr/bin/env ran
+
+// Native web serving: serve a front-end directory with the `web` module.
+// Run:  ran examples/website/app.ran
+// Then open http://localhost:8080/
+//
+// The web server picks correct content types from file extensions, sends
+// ETag/Last-Modified for cache validation, and (with web.spa(true)) falls back
+// to index.html for client-side routing. Dynamic HTTP routes can be registered
+// alongside the static assets.
+import "std::web" as web
+import "std::http" as http
+
+fn health() {
+    return "{\"status\": \"ok\"}"
+}
+
+fn main() {
+    web.spa(true)                       // unmatched paths serve index.html
+    http.get("/api/health", "health")   // dynamic route beside static assets
+    web.serve("public", 8080)
+}

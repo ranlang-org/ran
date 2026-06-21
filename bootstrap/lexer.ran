@@ -1,0 +1,156 @@
+#!/usr/bin/env ran
+# bootstrap/lexer.ran — a lexer for a subset of Ran, WRITTEN IN RAN.
+#
+# First component of the self-hosted compiler (Phase B1 of the bootstrap
+# roadmap). It runs on the current `ran` interpreter today, proving the
+# self-hosting path is real: Ran can already tokenize Ran source. It also passes
+# `--ownership=strict` (helpers borrow with `&`, owned values are not reused).
+#
+# Uses only core language features (no stdlib import): the string `.chars()`
+# method, array indexing, `push`, and lexicographic character comparison.
+#
+# Output: one `kind  text` token per line, then a count.
+
+# --- character classes (borrow the char; no moves) ---
+fn is_digit(c: &str) -> bool { return c >= "0" && c <= "9" }
+
+fn is_alpha(c: &str) -> bool {
+    let lo = c >= "a" && c <= "z"
+    let up = c >= "A" && c <= "Z"
+    return lo || up || c == "_"
+}
+
+fn is_alnum(c: &str) -> bool { return is_digit(c) || is_alpha(c) }
+
+fn is_space(c: &str) -> bool {
+    return c == " " || c == "\t" || c == "\n" || c == "\r"
+}
+
+fn is_keyword(w: &str) -> bool {
+    let kws = ["fn", "let", "mut", "if", "else", "return", "while", "for",
+               "in", "import", "as", "struct", "enum", "match", "impl",
+               "spawn", "true", "false"]
+    for k in kws {
+        if k == w { return true }
+    }
+    return false
+}
+
+fn two_char_op(s: &str) -> bool {
+    let ops = ["==", "!=", "<=", ">=", "&&", "||", "->", "=>", "::"]
+    for o in ops {
+        if o == s { return true }
+    }
+    return false
+}
+
+fn tok(kind, text) {
+    let m = map()
+    set(m, "kind", kind)
+    set(m, "text", text)
+    return m
+}
+
+# --- the lexer: source string -> array of {kind, text} tokens ---
+fn lex(src) {
+    let chars = src.chars()
+    let n = len(chars)
+    let mut tokens = []
+    let mut i = 0
+
+    while i < n {
+        if is_space(&chars[i]) {
+            i = i + 1
+        } else {
+            let mut handled = false
+
+            # line comment: `#...` or `//...` to end of line
+            let mut slashslash = false
+            if chars[i] == "/" && i + 1 < n {
+                if chars[i + 1] == "/" { slashslash = true }
+            }
+            if chars[i] == "#" || slashslash {
+                while i < n && chars[i] != "\n" { i = i + 1 }
+                handled = true
+            }
+
+            # string literal: "..."
+            if !handled && chars[i] == "\"" {
+                let mut s = ""
+                i = i + 1
+                while i < n && chars[i] != "\"" {
+                    s = s + chars[i]
+                    i = i + 1
+                }
+                i = i + 1
+                push(tokens, tok("str", s))
+                handled = true
+            }
+
+            # number
+            if !handled && is_digit(&chars[i]) {
+                let mut num = ""
+                while i < n && is_digit(&chars[i]) {
+                    num = num + chars[i]
+                    i = i + 1
+                }
+                push(tokens, tok("num", num))
+                handled = true
+            }
+
+            # identifier or keyword
+            if !handled && is_alpha(&chars[i]) {
+                let mut word = ""
+                while i < n && is_alnum(&chars[i]) {
+                    word = word + chars[i]
+                    i = i + 1
+                }
+                let mut kind = "ident"
+                if is_keyword(&word) { kind = "keyword" }
+                push(tokens, tok(kind, word))
+                handled = true
+            }
+
+            # two-char operator
+            if !handled && i + 1 < n {
+                let pair = chars[i] + chars[i + 1]
+                if two_char_op(&pair) {
+                    push(tokens, tok("op", pair))
+                    i = i + 2
+                    handled = true
+                }
+            }
+
+            # single-char operator / punctuation
+            if !handled {
+                push(tokens, tok("op", chars[i]))
+                i = i + 1
+            }
+        }
+    }
+
+    return tokens
+}
+
+fn main() {
+    let src = "fn add(a, b) { return a + b }"
+    echo "source: " + src
+    echo "---- tokens ----"
+    let tokens = lex(src)
+    for t in tokens {
+        echo t["kind"] + "  " + t["text"]
+    }
+    echo "---- count ----"
+    echo len(tokens)
+
+    # a second line exercising numbers, strings, and a two-char operator
+    let src2 = "let ok = (count == 42) && name"
+    echo "source: " + src2
+    echo "---- tokens ----"
+    let t2 = lex(src2)
+    for t in t2 {
+        echo t["kind"] + "  " + t["text"]
+    }
+    echo "---- count ----"
+    echo len(t2)
+}

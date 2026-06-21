@@ -1,0 +1,34 @@
+#!/usr/bin/env ran
+# Control Flow — if, for, while
+
+fn main() {
+    let score = 85
+
+    # If / else
+    if score > 90 {
+        echo "Grade: A"
+    } else {
+        if score > 80 {
+            echo "Grade: B"
+        } else {
+            echo "Grade: C"
+        }
+    }
+
+    # For loop with array
+    echo ""
+    echo "Counting:"
+    for i in [1, 2, 3, 4, 5] {
+        echo "  $i"
+    }
+
+    # While loop
+    echo ""
+    echo "Countdown:"
+    let mut n = 5
+    while n > 0 {
+        echo "  $n"
+        n = n - 1
+    }
+    echo "  Go!"
+}

@@ -1,0 +1,49 @@
+#!/usr/bin/env ran
+// showcase.ran - a tour of Ran v0.4 features
+// Run: ran showcase.ran
+
+import "std::math" as math    // stdlib needs a mandatory alias
+import "std::time" as time
+
+/* Three comment styles are supported:
+   # bash style
+   // C++ line style
+   /* nested block style */
+*/
+
+; this whole line is a comment because it starts with ';'
+
+fn fib(n: int) -> int {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    // Variables: bash-style and typed let
+    name="Ran"
+    let version: str = "0.4.0"
+    let mut count = 0
+
+    echo "Welcome to $name v$version"
+
+    // Statements can be separated with ';'
+    count = count + 1; count = count + 1
+    echo "count = $count"
+
+    // echo is literal; echo -e interprets escapes
+    echo    "literal: a\nb"
+    echo -e "escaped: a\nb"
+
+    // Recursion
+    let f = fib(10)
+    echo "fib(10) = $f"
+
+    // stdlib via alias
+    let biggest = math.max(3, 9)
+    echo "max(3, 9) = $biggest"
+
+    // Arrays and loops
+    for i in [1, 2, 3] {
+        echo "item $i"
+    }
+}

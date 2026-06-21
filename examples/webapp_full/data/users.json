@@ -1,0 +1,4 @@
+[
+  { "username": "admin", "role": "admin", "pass": "0d30c03ddf185aecd984568ce3fc2bdaacf8c8068befcbcc4a2b74ce252942b3" },
+  { "username": "user",  "role": "member", "pass": "3e6860a729328e4a93f59c2eddd243a80bb09a8071243707be835f9c800de529" }
+]

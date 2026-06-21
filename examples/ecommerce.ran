@@ -1,0 +1,56 @@
+# E-commerce checkout — prices "from the database" (here: a map), tax %, exact totals.
+# Demonstrates: decimal money math, tax rounding, JSON output for an API response.
+
+import "std::json" as json
+import "std::decimal" as decimal
+
+struct LineItem {
+    name: str,
+    price: decimal,
+    qty: int,
+}
+
+impl LineItem {
+    fn total(self) -> decimal {
+        return self.price * dec(str(self.qty))
+    }
+}
+
+# Simulates fetching a price "set in the database".
+fn price_of(sku) -> decimal {
+    if sku == "BOOK" { return dec("19.99") }
+    if sku == "PEN"  { return dec("2.50") }
+    if sku == "DESK" { return dec("149.00") }
+    return dec("0.00")
+}
+
+fn main() {
+    let tax_rate = dec("0.11")   # 11% VAT
+
+    let cart = [
+        LineItem { name: "BOOK", price: price_of("BOOK"), qty: 3 },
+        LineItem { name: "PEN",  price: price_of("PEN"),  qty: 10 },
+        LineItem { name: "DESK", price: price_of("DESK"), qty: 1 },
+    ]
+
+    let subtotal = dec("0.00")
+    for item in cart {
+        let line = item.total()
+        echo item.name + " x" + str(item.qty) + " = " + line
+        subtotal = subtotal + line
+    }
+
+    let tax = decimal.round(subtotal * tax_rate, 2, "half_up")
+    let total = subtotal + tax
+
+    echo "subtotal: " + subtotal
+    echo "tax(11%): " + tax
+    echo "total:    " + total
+
+    # Build a JSON API response with exact decimal numbers.
+    let resp = map()
+    set(resp, "subtotal", subtotal)
+    set(resp, "tax", tax)
+    set(resp, "total", total)
+    echo "JSON: " + json.encode(resp)
+}

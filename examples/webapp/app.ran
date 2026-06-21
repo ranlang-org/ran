@@ -1,0 +1,38 @@
+#!/usr/bin/env ran
+// Interactive Web App - Todo List
+// Run: cd examples/webapp && ran app.ran
+// Open: http://localhost:3000
+
+import "std::http" as http   // stdlib needs a mandatory alias
+import "std::fs" as fs
+
+fn handle_index() {
+    return fs.read("public/index.html")
+}
+
+fn handle_chat() {
+    return fs.read("public/chat.html")
+}
+
+fn handle_api_todos() {
+    return "[{\"id\":1,\"text\":\"Learn Ran\",\"done\":false},{\"id\":2,\"text\":\"Build something\",\"done\":false}]"
+}
+
+fn routes(p: int) {
+    http.get("/", "handle_index")
+    http.get("/chat", "handle_chat")
+    http.get("/api/todos", "handle_api_todos")
+    echo "Ran Web App on http://localhost:$p"
+    echo "  /        Todo App"
+    echo "  /chat    Chat App"
+    http.server(p)
+}
+
+// --port calls this with the chosen port
+fn port(p: int) {
+    routes(p)
+}
+
+fn main() {
+    routes(3000)   // default port
+}

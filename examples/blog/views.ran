@@ -1,0 +1,64 @@
+# views.ran — server-side layout and partials.
+#
+# The VIEW layer. layout() wraps every page so the <head>, the CSS/JS includes,
+# header, and footer live in ONE place (a single source of truth), like a Layout
+# component in a modern framework. Change one CSS file here and every page picks
+# it up.
+#
+# Style note: HTML strings are built line by line with `s = s + "..."`. In Ran a
+# single expression cannot continue onto the next line, so this accumulation
+# pattern is the tidy, reliable way to build multi-line HTML.
+#
+# Dynamic text is passed through escape_html() (from util.ran, pure Ran) before
+# it reaches the page.
+
+# Wrap `content` in a full HTML document.
+fn layout(title, content) {
+    let safe_title = escape_html(title)
+    let mut h = "<!DOCTYPE html>"
+    h = h + "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+    h = h + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    h = h + "<title>" + safe_title + " — Ran Blog</title>"
+    h = h + "<link rel=\"icon\" href=\"/favicon.svg\">"
+    h = h + "<link rel=\"stylesheet\" href=\"/assets/css/reset.css\">"
+    h = h + "<link rel=\"stylesheet\" href=\"/assets/css/blog.css\">"
+    h = h + "</head><body>"
+    h = h + site_header()
+    h = h + "<main class=\"container\">" + content + "</main>"
+    h = h + site_footer()
+    h = h + "<script src=\"/assets/js/enhance.js\"></script>"
+    h = h + "</body></html>"
+    return h
+}
+
+# Site header with navigation (shared partial).
+fn site_header() {
+    let mut h = "<header class=\"site-header\"><div class=\"bar container\">"
+    h = h + "<a class=\"brand\" href=\"/\">Ran Blog</a>"
+    h = h + "<nav class=\"nav\"><a href=\"/\">Home</a><a href=\"/about\">About</a></nav>"
+    h = h + "</div></header>"
+    return h
+}
+
+# Site footer (shared partial).
+fn site_footer() {
+    let mut h = "<footer class=\"site-footer\"><div class=\"container\">"
+    h = h + "Built with Ran — server, layout, and assets in one project."
+    h = h + "</div></footer>"
+    return h
+}
+
+# Compact card for one post in the home list.
+fn post_card(p) {
+    let slug = p["slug"]
+    let title = escape_html(p["title"])
+    let date = escape_html(p["date"])
+    let summary = escape_html(p["summary"])
+    let mut h = "<article class=\"card\">"
+    h = h + "<h2 class=\"card-title\"><a href=\"/posts/" + slug + "\">" + title + "</a></h2>"
+    h = h + "<p class=\"meta\">" + date + "</p>"
+    h = h + "<p class=\"summary\">" + summary + "</p>"
+    h = h + "<a class=\"more\" href=\"/posts/" + slug + "\">Read more →</a>"
+    h = h + "</article>"
+    return h
+}

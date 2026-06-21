@@ -1,0 +1,26 @@
+#!/usr/bin/env ran
+// HTTP Server - built-in networking
+// Run:  ran webserver.ran            (port 8080)
+//       ran webserver.ran --port 80  (calls fn port(80))
+// Test: curl http://localhost:8080
+
+import "std::http" as http   // stdlib requires a mandatory alias
+
+fn home() {
+    return "<h1>Ran HTTP Server</h1>"
+}
+
+fn start(p: int) {
+    http.get("/", "home")
+    echo "Listening on http://0.0.0.0:$p"
+    http.server(p)   // blocking
+}
+
+// --port p calls this function (no double port)
+fn port(p: int) {
+    start(p)
+}
+
+fn main() {
+    start(8080)
+}

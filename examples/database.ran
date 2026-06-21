@@ -1,0 +1,65 @@
+#!/usr/bin/env ran
+
+// SQLite database tour: connect, parameterized writes, query, transactions,
+// and exact decimal money. Run: ran examples/database.ran
+//
+// If the system SQLite library is unavailable, db.connect returns an error
+// value (code E0501) and the program reports a clean skip instead of crashing.
+import "std::db" as db
+import "std::decimal" as decimal
+
+fn main() {
+    let path = ".tmp_tests/example_ledger.sqlite"
+    let conn = db.connect(path)
+
+    // Error values are maps carrying an `error: true` marker.
+    if typeof(conn) == "map" {
+        echo "SKIP: SQLite library unavailable (" + conn["code"] + ")"
+        return
+    }
+
+    // Schema. Money is stored as exact decimal TEXT, never as a float.
+    db.exec(conn, "CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, owner TEXT, balance TEXT)", [])
+    db.exec(conn, "DELETE FROM accounts", [])
+
+    // Parameterized inserts — values are bound, never interpolated.
+    db.exec(conn, "INSERT INTO accounts (owner, balance) VALUES (?, ?)", ["Alice", dec("1000.00")])
+    db.exec(conn, "INSERT INTO accounts (owner, balance) VALUES (?, ?)", ["Bob", dec("250.00")])
+
+    echo "== balances before =="
+    show_balances(&conn)
+
+    // Transfer 125.50 from Alice (id 1) to Bob (id 2), atomically.
+    transfer(&conn, 1, 2, dec("125.50"))
+
+    echo "== balances after transfer =="
+    show_balances(&conn)
+
+    db.close(conn)
+    echo "done."
+}
+
+fn show_balances(conn: &int) {
+    let rows = db.query(conn, "SELECT owner, balance FROM accounts ORDER BY id", [])
+    for row in rows {
+        let owner = row["owner"]
+        let balance = row["balance"]
+        echo "  $owner: $balance"
+    }
+}
+
+fn transfer(conn: &int, from_id, to_id, amount) {
+    db.begin(conn)
+
+    let from = db.query(conn, "SELECT balance FROM accounts WHERE id = ?", [from_id])
+    let to = db.query(conn, "SELECT balance FROM accounts WHERE id = ?", [to_id])
+
+    let from_new = decimal.parse(from[0]["balance"]) - amount
+    let to_new = decimal.parse(to[0]["balance"]) + amount
+
+    db.exec(conn, "UPDATE accounts SET balance = ? WHERE id = ?", [from_new, from_id])
+    db.exec(conn, "UPDATE accounts SET balance = ? WHERE id = ?", [to_new, to_id])
+
+    db.commit(conn)
+    echo "transferred $amount (atomic; total balance preserved)"
+}

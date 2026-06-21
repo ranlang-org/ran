@@ -1,0 +1,140 @@
+/* blog.css — tampilan blog. Berkas CSS kedua, dimuat setelah reset.css. */
+:root {
+    --bg: #0f1117;
+    --surface: #171a23;
+    --border: #262b38;
+    --text: #e7e9f0;
+    --muted: #9aa3b8;
+    --accent: #6ea8fe;
+    --maxw: 46rem;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+.container {
+    width: 100%;
+    max-width: var(--maxw);
+    margin-inline: auto;
+    padding-inline: 1.25rem;
+}
+
+/* Header */
+.site-header {
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+}
+
+.bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-block: 1rem;
+}
+
+.brand {
+    font-weight: 700;
+    font-size: 1.15rem;
+    text-decoration: none;
+    color: var(--accent);
+}
+
+.nav a {
+    margin-left: 1rem;
+    color: var(--muted);
+    text-decoration: none;
+}
+
+.nav a:hover {
+    color: var(--text);
+}
+
+/* Main */
+main.container {
+    padding-block: 2.5rem;
+}
+
+.page-title {
+    font-size: 1.9rem;
+    margin-bottom: 1.5rem;
+}
+
+/* Post list */
+.post-list {
+    display: grid;
+    gap: 1.25rem;
+}
+
+.card {
+    padding: 1.25rem 1.4rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.8rem;
+}
+
+.card-title {
+    font-size: 1.3rem;
+    margin-bottom: 0.25rem;
+}
+
+.card-title a {
+    text-decoration: none;
+}
+
+.card-title a:hover {
+    color: var(--accent);
+}
+
+.meta {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-bottom: 0.6rem;
+}
+
+.summary {
+    color: var(--text);
+    margin-bottom: 0.8rem;
+}
+
+.more {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+/* Single post */
+.post .prose {
+    font-size: 1.08rem;
+}
+
+.prose p {
+    margin-bottom: 1rem;
+}
+
+.prose code {
+    padding: 0.1rem 0.35rem;
+    background: rgba(110, 168, 254, 0.15);
+    border-radius: 0.35rem;
+    font-size: 0.95em;
+}
+
+.back {
+    margin-top: 2rem;
+}
+
+.back a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+/* Footer */
+.site-footer {
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.85rem;
+    padding-block: 1.5rem;
+    margin-top: 3rem;
+}

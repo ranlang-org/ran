@@ -1,0 +1,30 @@
+/* reset.css — penyetelan dasar lintas-peramban. Berkas CSS pertama yang dimuat. */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+* {
+    margin: 0;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+}
+
+img,
+picture,
+svg {
+    display: block;
+    max-width: 100%;
+}
+
+a {
+    color: inherit;
+}

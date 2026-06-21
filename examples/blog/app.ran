@@ -1,0 +1,38 @@
+#!/usr/bin/env ran
+# app.ran — entry point: wire routes, then serve.
+#
+# The BOOTSTRAP layer. This file ties everything together:
+#   content.ran  -> data        (model)
+#   views.ran    -> layout       (view)
+#   routes.ran   -> handlers     (controller)
+#   util.ran     -> pure-Ran helpers (no built-in library)
+#   public/      -> static assets (URL mirrors the file path)
+import "std::http" as http
+import "std::web" as web
+import "std::log" as log
+import "./util"
+import "./content"
+import "./routes"
+import "./views"
+
+# One route table, used by both main() and port(p).
+fn register_routes() {
+    http.get("/", "page_home")
+    http.get("/about", "page_about")
+    http.get("/posts/:slug", "page_post")
+}
+
+# Run on the default port. Run: ran examples/blog/app.ran
+fn main() {
+    register_routes()
+    log.info("blog server starting on http://localhost:8080")
+    # public/ is the web root: static assets are served with URL == file path.
+    web.serve("public", 8080)
+}
+
+# Entry point for `--port N`. Run: ran examples/blog/app.ran --port 3000
+fn port(p: int) {
+    register_routes()
+    log.info("blog server starting on port " + str(p))
+    web.serve("public", p)
+}

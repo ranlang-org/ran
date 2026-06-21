@@ -1,0 +1,42 @@
+#!/usr/bin/env ran
+# Ownership & Borrowing in Ran — memory safety without a garbage collector.
+#
+# Ran tracks who owns each value. Scalars (int, float, bool) are cheap and are
+# copied on use; everything else (str, arrays, maps, structs) has a single owner
+# and is *moved* when handed to another binding or function. Borrows let a
+# function read a value without taking ownership.
+#
+# Run it under both rollout modes:
+#   ran run --ownership=warn   examples/ownership.ran   # ownership notes only
+#   ran run --ownership=strict examples/ownership.ran   # ownership enforced
+#
+# Syntax note: deref-assignment through a reference (`*p = ...`) is not part of
+# the supported surface syntax yet, so the idiomatic way to update a value is to
+# return the new value and rebind it (see `bumped` below). See docs/05-ownership.md.
+
+# Immutable borrow: `greet` reads the name through `&str` without owning it, so
+# the caller keeps full ownership and can keep using `name` afterwards.
+fn greet(name: &str) {
+    echo "Hello, $name!"
+}
+
+# Return-an-owned-value form: `bumped` takes a copy of an int (scalars are Copy),
+# computes the next value, and returns it. The caller rebinds the result.
+fn bumped(val: int) -> int {
+    return val + 1
+}
+
+fn main() {
+    # Owned value.
+    let name = "Ran"
+
+    # Immutable borrow — `name` stays valid after the call.
+    greet(&name)
+    echo "Still valid: $name"
+
+    # Mutable variable, updated by rebinding the returned value.
+    let mut counter = 0
+    counter = bumped(counter)
+    counter = bumped(counter)
+    echo "Counter: $counter"
+}

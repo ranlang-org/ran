@@ -1,0 +1,63 @@
+#!/usr/bin/env ran
+
+// Concurrency tour: thread join, channels, wait groups, and shared state.
+// Run: ran examples/concurrency.ran
+import "std::concurrency" as conc
+import "std::time" as time
+
+fn main() {
+    echo "== 1. join: collect a thread's result =="
+    spawn {
+        time.sleep(20)
+        return 42
+    }
+    let h = conc.last_thread()
+    let answer = conc.join(h)
+    echo "worker returned $answer"
+
+    echo "== 2. channel: stream values between threads =="
+    let ch = conc.chan(4)
+    spawn {
+        let mut i = 1
+        while i <= 3 {
+            conc.send(ch, i * 10)
+            i = i + 1
+        }
+        conc.close(ch)
+    }
+    let producer = conc.last_thread()
+    let mut done = false
+    while !done {
+        let v = conc.recv(ch)
+        if conc.is_closed(v) {
+            done = true
+        } else {
+            echo "received $v"
+        }
+    }
+    conc.join(producer)
+
+    echo "== 3. wait group + shared state: parallel counting =="
+    let counter = conc.shared(0)
+    let wg = conc.waitgroup()
+    conc.add(wg, 4)
+
+    let mut w = 0
+    while w < 4 {
+        spawn {
+            let mut j = 0
+            while j < 250 {
+                conc.shared_add(counter, 1)   // atomic, no lost updates
+                j = j + 1
+            }
+            conc.done(wg)
+        }
+        w = w + 1
+    }
+
+    conc.wait(wg)
+    let total = conc.shared_get(counter)
+    echo "counter total = $total (expected 1000)"
+
+    echo "All done."
+}

@@ -1,0 +1,18 @@
+#!/usr/bin/env ran
+# Comments demo - Ran supports three comment styles
+
+// This is a C++ style line comment
+# This is a bash style line comment
+
+/*
+   This is a block comment.
+   It can span multiple lines.
+   /* and it can be nested */
+*/
+
+fn main() {
+    echo "Comments work"   // inline C++ comment
+    echo "All three styles" # inline bash comment
+    let x = 42 /* inline block */ 
+    echo "x = $x"
+}

@@ -1,0 +1,61 @@
+#!/usr/bin/env ran
+// stdlib_tour.ran - tour of Ran v0.4 standard library
+// Run: ran stdlib_tour.ran
+
+import "std::math" as math
+import "std::json" as json
+import "std::str" as str
+import "std::rand" as rand
+import "std::os" as os
+import "std::fs" as fs
+import "std::time" as time
+
+fn main() {
+    echo "=== math ==="
+    let root = math.sqrt(16.0)
+    echo "sqrt(16) = $root"
+    let power = math.pow(2.0, 8.0)
+    echo "2^8 = $power"
+    echo "pi = ${pi}"
+    let pi = math.pi()
+    echo "pi = $pi"
+    let rounded = math.round(3.6)
+    echo "round(3.6) = $rounded"
+
+    echo "=== json ==="
+    let obj = json.decode("{\"lang\": \"Ran\", \"year\": 2026, \"fast\": true}")
+    let lang = obj["lang"]
+    let year = obj["year"]
+    echo "lang=$lang year=$year"
+    let encoded = json.encode([1, 2, 3])
+    echo "encoded: $encoded"
+
+    echo "=== str ==="
+    echo "upper: ${u}"
+    let u = str.upper("ran lang")
+    echo "upper: $u"
+    let joined = str.join(["a", "b", "c"], "-")
+    echo "joined: $joined"
+
+    echo "=== rand ==="
+    let dice = rand.int(1, 7)
+    echo "dice roll: $dice"
+
+    echo "=== os ==="
+    let plat = os.platform()
+    let arch = os.arch()
+    echo "running on $plat/$arch"
+
+    echo "=== fs ==="
+    fs.write("/tmp/ran_demo.txt", "hello from ran")
+    let content = fs.read("/tmp/ran_demo.txt")
+    echo "file content: $content"
+    fs.remove("/tmp/ran_demo.txt")
+
+    echo "=== range + loop ==="
+    for i in range(1, 4) {
+        echo "i = $i"
+    }
+
+    echo "=== done ==="
+}

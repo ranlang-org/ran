@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard — Ran</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="topbar">
+    <strong>Ran Dashboard</strong>
+    <div>
+      <span class="badge">{{user}} · {{role}}</span>
+      <button class="secondary" id="logout">Log out</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <h1>Your tasks</h1>
+    <form class="row" id="new">
+      <input id="text" placeholder="Add a task and press Enter" autocomplete="off" />
+      <button type="submit">Add</button>
+    </form>
+    <div id="list"></div>
+  </div>
+
+  <script>
+    async function load() {
+      const res = await fetch("/api/tasks");
+      if (res.status === 401) { location.href = "/login"; return; }
+      render(await res.json());
+    }
+    function render(tasks) {
+      const box = document.getElementById("list");
+      box.innerHTML = "";
+      for (const t of tasks) {
+        const div = document.createElement("div");
+        div.className = "task" + (t.done ? " done" : "");
+        const cb = document.createElement("input");
+        cb.type = "checkbox"; cb.checked = !!t.done;
+        cb.onchange = () => toggle(t.id, cb.checked);
+        const span = document.createElement("span");
+        span.textContent = t.text;
+        const del = document.createElement("button");
+        del.className = "danger"; del.textContent = "✕";
+        del.onclick = () => remove(t.id);
+        div.append(cb, span, del);
+        box.appendChild(div);
+      }
+    }
+    async function add(text) {
+      await fetch("/api/tasks", { method: "POST", body: JSON.stringify({ text }) });
+      load();
+    }
+    async function toggle(id, done) {
+      await fetch(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify({ done }) });
+      load();
+    }
+    async function remove(id) {
+      await fetch(`/api/tasks/${id}`, { method: "DELETE" });
+      load();
+    }
+    document.getElementById("new").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const i = document.getElementById("text");
+      if (i.value.trim()) { add(i.value.trim()); i.value = ""; }
+    });
+    document.getElementById("logout").onclick = async () => {
+      await fetch("/logout", { method: "POST" });
+      location.href = "/login";
+    };
+    load();
+    setInterval(load, 2000);   // light polling so changes from other tabs appear
+  </script>
+</body>
+</html>

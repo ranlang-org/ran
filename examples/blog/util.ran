@@ -1,0 +1,19 @@
+# util.ran — helpers written in PURE Ran (no built-in library).
+#
+# This module imports NOTHING: no `std::` module at all. It shows how ordinary
+# logic can already be written entirely in Ran today, on top of core language
+# features only (here, the built-in string `.replace` method, which is part of
+# the language, not an imported module). As the language grows, more of the
+# standard library can move into plain-Ran modules like this one.
+
+# Escape text for safe embedding in HTML (a basic XSS guard). Order matters:
+# replace `&` first so the ampersands introduced by the other replacements are
+# not escaped a second time.
+fn escape_html(s) {
+    let mut out = s
+    out = out.replace("&", "&amp;")
+    out = out.replace("<", "&lt;")
+    out = out.replace(">", "&gt;")
+    out = out.replace("\"", "&quot;")
+    return out
+}

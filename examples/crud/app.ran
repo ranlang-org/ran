@@ -1,0 +1,121 @@
+#!/usr/bin/env ran
+# Realtime CRUD notes board — data persisted to a JSON file.
+#
+# Run:   cd examples/crud && ran app.ran
+# Open:  http://localhost:8080
+#
+# REST API (all JSON):
+#   GET    /api/notes        list all notes
+#   POST   /api/notes        create  { "text": "..." }
+#   PUT    /api/notes/:id    update  { "text": "..." }
+#   DELETE /api/notes/:id    delete
+#
+# The browser UI (public/index.html) polls GET /api/notes every second, so
+# changes made in one tab appear in every other tab within ~1s ("realtime").
+
+import "std::http" as http      # load the standard HTTP module, name it `http`
+import "std::fs"   as fs        # filesystem
+import "std::json" as json      # JSON encode/decode
+import "std::time" as time      # timestamps / ids
+import "std::log"  as log       # leveled logging
+
+DATA_FILE = "data/notes.json"
+
+# --- Persistence helpers ----------------------------------------------------
+
+# Read the notes array from disk; an empty list if the file does not exist yet.
+fn load_notes() -> array {
+    if fs.exists(DATA_FILE) {
+        return json.decode(fs.read(DATA_FILE))
+    }
+    return []
+}
+
+# Write the notes array back to disk as pretty JSON.
+fn save_notes(notes) {
+    fs.write(DATA_FILE, json.pretty(notes))
+}
+
+# --- Handlers ---------------------------------------------------------------
+# A handler is a function whose name is registered for a route. The HTTP server
+# injects the request into these variables before calling it:
+#   $req_method  $req_path  $req_body  $param_<name>  $query_<name>
+
+# GET /api/notes -> the whole list as a JSON array.
+fn list_notes() -> str {
+    return json.encode(load_notes())
+}
+
+# POST /api/notes  body { "text": "..." } -> the created note.
+fn create_note() -> str {
+    let body = json.decode(req_body)
+    let text = body["text"]
+    if text == "" {
+        return "{\"error\":\"text is required\"}"
+    }
+
+    let note = map()
+    set(note, "id", str(time.now_ms()))     # string id (easy to compare with path params)
+    set(note, "text", text)
+    set(note, "created", time.now())
+
+    let notes = load_notes()
+    push(notes, note)
+    save_notes(notes)
+
+    log.info("created note", get(note, "id"))
+    return json.encode(note)
+}
+
+# PUT /api/notes/:id  body { "text": "..." } -> { "ok": true } or 404-ish error.
+fn update_note() -> str {
+    let body = json.decode(req_body)
+    let new_text = body["text"]
+
+    let notes = load_notes()
+    let result = []
+    let found = false
+    for n in notes {
+        if str(n["id"]) == param_id {
+            set(n, "text", new_text)
+            found = true
+        }
+        push(result, n)
+    }
+    save_notes(result)
+
+    if found {
+        return "{\"ok\":true}"
+    }
+    return "{\"error\":\"not found\"}"
+}
+
+# DELETE /api/notes/:id -> { "ok": true }.
+fn delete_note() -> str {
+    let notes = load_notes()
+    let result = []
+    for n in notes {
+        if str(n["id"]) != param_id {
+            push(result, n)
+        }
+    }
+    save_notes(result)
+    log.info("deleted note", param_id)
+    return "{\"ok\":true}"
+}
+
+# --- Wiring -----------------------------------------------------------------
+
+fn main() {
+    if !fs.exists("data") {
+        fs.mkdir("data")
+    }
+
+    http.get("/api/notes", "list_notes")
+    http.post("/api/notes", "create_note")
+    http.put("/api/notes/:id", "update_note")
+    http.delete("/api/notes/:id", "delete_note")
+
+    log.info("CRUD notes board on http://localhost:8080")
+    http.server(8080)        # serves public/ as static files, then routes above
+}

@@ -1,0 +1,34 @@
+#!/usr/bin/env ran
+# Variables & Types
+
+# Bash-style declaration (mutable by default)
+name="Ran"
+port=8080
+pi=3.14
+is_ready=true
+
+# Let binding (immutable)
+let version = "0.1.0"
+
+# Let mut (mutable, explicit)
+let mut counter = 0
+
+fn main() {
+    echo "Name: $name"
+    echo "Port: $port"
+    echo "Pi: $pi"
+    echo "Ready: $is_ready"
+    echo "Version: $version"
+
+    counter = counter + 1
+    echo "Counter: $counter"
+
+    # Type inference
+    let x = 42
+    let msg = "hello"
+    let items = [1, 2, 3]
+
+    echo "x = $x"
+    echo "msg = $msg"
+    println(items)
+}

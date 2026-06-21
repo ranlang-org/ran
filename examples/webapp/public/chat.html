@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ran Chat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, sans-serif;
+            background: #0f0f23;
+            color: #ccc;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 16px 20px;
+            background: #1a1a3e;
+            border-bottom: 1px solid #333;
+            text-align: center;
+        }
+        header h1 { font-size: 1.2rem; color: #667eea; }
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        .msg {
+            max-width: 70%;
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 0.95rem;
+            line-height: 1.4;
+        }
+        .msg.sent {
+            background: #667eea;
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 4px;
+        }
+        .msg.recv {
+            background: #1a1a3e;
+            border: 1px solid #333;
+            border-bottom-left-radius: 4px;
+        }
+        .msg .time {
+            font-size: 0.7rem;
+            color: rgba(255,255,255,0.5);
+            margin-top: 4px;
+        }
+        .input-area {
+            display: flex;
+            gap: 10px;
+            padding: 16px 20px;
+            background: #1a1a3e;
+            border-top: 1px solid #333;
+        }
+        .input-area input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #333;
+            border-radius: 20px;
+            background: #0f0f23;
+            color: #eee;
+            font-size: 1rem;
+            outline: none;
+        }
+        .input-area input:focus { border-color: #667eea; }
+        .input-area button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 20px;
+            background: #667eea;
+            color: white;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Ran Chat</h1>
+    </header>
+    <div class="messages" id="messages">
+        <div class="msg recv">
+            <div>Welcome to Ran Chat! This server is powered by the Ran programming language.</div>
+            <div class="time">System</div>
+        </div>
+    </div>
+    <div class="input-area">
+        <input type="text" id="input" placeholder="Type a message..." autofocus>
+        <button onclick="send()">Send</button>
+    </div>
+    <script>
+        const input = document.getElementById('input');
+        const messages = document.getElementById('messages');
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+        function send() {
+            const text = input.value.trim();
+            if (!text) return;
+            addMsg(text, 'sent');
+            input.value = '';
+
+            // Echo response from "server"
+            setTimeout(() => {
+                const responses = [
+                    `You said: "${text}"`,
+                    `Message received! (${text.length} chars)`,
+                    `Ran processed your message at ${new Date().toLocaleTimeString()}`,
+                ];
+                const reply = responses[Math.floor(Math.random() * responses.length)];
+                addMsg(reply, 'recv');
+            }, 300 + Math.random() * 500);
+        }
+
+        function addMsg(text, type) {
+            const div = document.createElement('div');
+            div.className = `msg ${type}`;
+            const time = new Date().toLocaleTimeString();
+            div.innerHTML = `<div>${text}</div><div class="time">${time}</div>`;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+    </script>
+</body>
+</html>

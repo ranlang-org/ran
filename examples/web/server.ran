@@ -1,0 +1,42 @@
+// server.ran - a tiny web server in Ran
+// Run:  ran web/server.ran --port 4000
+// Test: curl localhost:4000/  and  curl localhost:4000/api/hi/Ran
+
+import "std::http" as http   // stdlib must be imported with a mandatory alias
+
+// A route handler is a function that returns a string.
+// HTML if it starts with '<', JSON if '{' or '[', else plain text.
+// Request data arrives as variables: $req_method $req_path $req_body
+// path params  /hi/:name   -> $param_name
+// query params /search?q=x -> $query_q
+
+fn home() {
+    return "<h1>Welcome to Ran</h1><p>Fast. Simple. Native.</p>"
+}
+
+fn health() {
+    return "{\"status\": \"ok\", \"engine\": \"ran\"}"
+}
+
+fn greet() {
+    return "Hello, $param_name!"
+}
+
+fn search() {
+    return "You searched for: $query_q"
+}
+
+// --port calls this function with the chosen port (int).
+fn port(p: int) {
+    http.get("/", "home")
+    http.get("/api/health", "health")
+    http.get("/api/hi/:name", "greet")
+    http.get("/search", "search")
+    echo "Server on port $p"
+    http.server(p)
+}
+
+fn main() {
+    // Default run (no --port): serve on 8080
+    port(8080)
+}

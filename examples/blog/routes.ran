@@ -1,0 +1,72 @@
+# routes.ran — request handlers (controllers).
+#
+# The ROUTE layer. Each handler returns an HTML string assembled through the
+# shared layout() in views.ran, using data from content.ran. The URL→handler
+# mapping is registered in app.ran.
+#
+# Logging best practice: every request is logged once, at a single point, with
+# method, path, and the status we returned. Logs go to stderr (via the `log`
+# module) so stdout stays clean.
+import "std::http" as http
+import "std::log" as log
+
+# Log one request line. `req_method` and `req_path` are injected by the server
+# into the handler scope, so they are visible to this helper too.
+fn log_request(status) {
+    log.info(req_method + " " + req_path + " -> " + str(status))
+}
+
+# GET / — home: list every post.
+fn page_home() {
+    log_request(200)
+    let posts = all_posts()
+    let mut list = ""
+    for p in posts {
+        list = list + post_card(p)
+    }
+    let mut content = "<h1 class=\"page-title\">Latest Posts</h1>"
+    content = content + "<div class=\"post-list\">" + list + "</div>"
+    return layout("Home", content)
+}
+
+# GET /about — a simple page that still uses the shared layout.
+fn page_about() {
+    log_request(200)
+    let mut content = "<h1 class=\"page-title\">About</h1>"
+    content = content + "<div class=\"prose\">"
+    content = content + "<p>An example blog that shows a tidy web project structure in Ran: server-side routes, a shared layout, and organized static assets.</p>"
+    content = content + "<p>Asset URLs mirror the file paths under <code>public/</code>.</p>"
+    content = content + "</div>"
+    return layout("About", content)
+}
+
+# GET /posts/:slug — a single post. The slug arrives as the injected variable
+# `param_slug` in the handler scope.
+fn page_post() {
+    let slug = param_slug
+    let p = find_post(slug)
+    if len(keys(p)) == 0 {
+        return page_not_found()
+    }
+    log_request(200)
+    let title = escape_html(p["title"])
+    let date = escape_html(p["date"])
+    let body = escape_html(p["body"])
+    let mut content = "<article class=\"post\">"
+    content = content + "<h1 class=\"page-title\">" + title + "</h1>"
+    content = content + "<p class=\"meta\">" + date + "</p>"
+    content = content + "<div class=\"prose\"><p>" + body + "</p></div>"
+    content = content + "<p class=\"back\"><a href=\"/\">← Back to home</a></p>"
+    content = content + "</article>"
+    return layout(p["title"], content)
+}
+
+# 404 page with the correct status code.
+fn page_not_found() {
+    http.set_status(404)
+    log.warn(req_method + " " + req_path + " -> 404")
+    let mut content = "<h1 class=\"page-title\">404</h1>"
+    content = content + "<div class=\"prose\"><p>Post not found. "
+    content = content + "<a href=\"/\">Back to home</a>.</p></div>"
+    return layout("Not found", content)
+}

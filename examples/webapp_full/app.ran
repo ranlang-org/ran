@@ -1,0 +1,198 @@
+#!/usr/bin/env ran
+# Full web app: login + signed sessions + role-aware dashboard + per-user task
+# CRUD, with JSON files as the raw data store.
+#
+# Run:   cd examples/webapp_full && ran app.ran
+# Open:  http://localhost:8080   (login: admin / admin123  or  user / secret123)
+#
+# Sessions are STATELESS and signed: the cookie is `username.HMAC(secret,user)`,
+# verified on every request — no server-side session table needed. Passwords are
+# stored as sha256(salt + ":" + password) in data/users.json (never plaintext).
+
+import "std::http"   as http
+import "std::fs"     as fs
+import "std::json"   as json
+import "std::time"   as time
+import "std::log"    as log
+import "std::crypto" as crypto
+import "std::str"    as str
+
+# --- Config (in a real app these come from env.require) ---------------------
+SALT = "ran-demo-salt"          # password-hash salt
+SECRET = "ran-demo-session-key" # session-signing key
+USERS_FILE = "data/users.json"
+TASKS_FILE = "data/tasks.json"
+
+# --- Storage ----------------------------------------------------------------
+fn load_users() -> array {
+    if fs.exists(USERS_FILE) { return json.decode(fs.read(USERS_FILE)) }
+    return []
+}
+fn load_tasks() -> array {
+    if fs.exists(TASKS_FILE) { return json.decode(fs.read(TASKS_FILE)) }
+    return []
+}
+fn save_tasks(tasks) {
+    fs.write(TASKS_FILE, json.pretty(tasks))
+}
+
+# --- Auth -------------------------------------------------------------------
+
+# Return the logged-in username from the signed session cookie, or "" if none.
+fn current_user() -> str {
+    let raw = cookie_session
+    if typeof(raw) != "string" { return "" }       # no cookie present
+    let parts = str.split(raw, ".")
+    if len(parts) != 2 { return "" }
+    let user = parts[0]
+    let sig = parts[1]
+    if crypto.hmac_sha256(SECRET, user) == sig { return user }
+    return ""                                       # bad/forged signature
+}
+
+# Look up a user's role (or "" if unknown).
+fn role_of(username) -> str {
+    for u in load_users() {
+        if u["username"] == username { return u["role"] }
+    }
+    return ""
+}
+
+# --- Page handlers ----------------------------------------------------------
+fn home() -> str {
+    http.redirect("/dashboard")
+    return ""
+}
+
+fn login_page() -> str {
+    return fs.read("public/login.html")
+}
+
+fn dashboard() -> str {
+    let user = current_user()
+    if user == "" {
+        http.redirect("/login")
+        return ""
+    }
+    let tpl = fs.read("public/dashboard.html")
+    let tpl2 = str.replace(tpl, "{{user}}", user)
+    return str.replace(tpl2, "{{role}}", role_of(user))
+}
+
+# --- Auth API ---------------------------------------------------------------
+fn login() -> str {
+    let creds = json.decode(req_body)
+    let username = creds["username"]
+    let password = creds["password"]
+    let hash = crypto.sha256(SALT + ":" + password)
+
+    for u in load_users() {
+        if u["username"] == username {
+            if u["pass"] == hash {
+                let token = username + "." + crypto.hmac_sha256(SECRET, username)
+                http.set_cookie("session", token, 86400)
+                log.info("login ok", username)
+                return "{\"ok\":true}"
+            }
+        }
+    }
+    http.set_status(401)
+    log.warn("login failed", username)
+    return "{\"error\":\"invalid credentials\"}"
+}
+
+fn logout() -> str {
+    http.clear_cookie("session")
+    return "{\"ok\":true}"
+}
+
+fn api_me() -> str {
+    let user = current_user()
+    if user == "" {
+        http.set_status(401)
+        return "{\"error\":\"unauthorized\"}"
+    }
+    let m = map()
+    set(m, "username", user)
+    set(m, "role", role_of(user))
+    return json.encode(m)
+}
+
+# --- Task CRUD (per-user) ---------------------------------------------------
+fn list_tasks() -> str {
+    let user = current_user()
+    if user == "" { http.set_status(401); return "{\"error\":\"unauthorized\"}" }
+    let mine = []
+    for t in load_tasks() {
+        if t["owner"] == user { push(mine, t) }
+    }
+    return json.encode(mine)
+}
+
+fn create_task() -> str {
+    let user = current_user()
+    if user == "" { http.set_status(401); return "{\"error\":\"unauthorized\"}" }
+    let body = json.decode(req_body)
+    let text = body["text"]
+    if text == "" { http.set_status(400); return "{\"error\":\"text required\"}" }
+
+    let t = map()
+    set(t, "id", str(time.now_ms()))
+    set(t, "owner", user)
+    set(t, "text", text)
+    set(t, "done", false)
+
+    let all = load_tasks()
+    push(all, t)
+    save_tasks(all)
+    return json.encode(t)
+}
+
+fn update_task() -> str {
+    let user = current_user()
+    if user == "" { http.set_status(401); return "{\"error\":\"unauthorized\"}" }
+    let body = json.decode(req_body)
+    let result = []
+    for t in load_tasks() {
+        if str(t["id"]) == param_id && t["owner"] == user {
+            set(t, "done", body["done"])
+        }
+        push(result, t)
+    }
+    save_tasks(result)
+    return "{\"ok\":true}"
+}
+
+fn delete_task() -> str {
+    let user = current_user()
+    if user == "" { http.set_status(401); return "{\"error\":\"unauthorized\"}" }
+    let result = []
+    for t in load_tasks() {
+        # keep everything except this user's task with this id
+        if str(t["id"]) != param_id || t["owner"] != user {
+            push(result, t)
+        }
+    }
+    save_tasks(result)
+    return "{\"ok\":true}"
+}
+
+# --- Routes -----------------------------------------------------------------
+fn main() {
+    if !fs.exists("data") { fs.mkdir("data") }
+
+    http.get("/", "home")
+    http.get("/login", "login_page")
+    http.post("/login", "login")
+    http.post("/logout", "logout")
+    http.get("/dashboard", "dashboard")
+
+    http.get("/api/me", "api_me")
+    http.get("/api/tasks", "list_tasks")
+    http.post("/api/tasks", "create_task")
+    http.put("/api/tasks/:id", "update_task")
+    http.delete("/api/tasks/:id", "delete_task")
+
+    log.info("Full web app on http://localhost:8080 (admin/admin123, user/secret123)")
+    http.server(8080)
+}

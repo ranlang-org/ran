@@ -1,0 +1,23 @@
+[package]
+name = "ran"
+version = "0.2.1"
+edition = "2021"
+authors = ["Ran Contributors"]
+description = "Ran Programming Language - a self-hosted language for internal systems and business tooling"
+license = "MIT"
+
+[[bin]]
+name = "ran"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+# `unwind` (not `abort`) so the HTTP server can catch a faulting request handler
+# and return 500 instead of the whole process dying. See src/runtime (RuntimeFault).
+panic = "unwind"
+codegen-units = 1
+overflow-checks = false

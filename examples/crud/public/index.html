@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ran — Realtime Notes</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    form { display: flex; gap: .5rem; margin: 1rem 0; }
+    input { flex: 1; padding: .5rem; }
+    button { padding: .5rem .8rem; cursor: pointer; }
+    li { display: flex; gap: .5rem; align-items: center; padding: .4rem 0; border-bottom: 1px solid #eee; }
+    li span { flex: 1; }
+    .muted { color: #888; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>Realtime Notes <span class="muted" id="status"></span></h1>
+
+  <form id="new">
+    <input id="text" placeholder="Write a note and press Enter" autocomplete="off" />
+    <button type="submit">Add</button>
+  </form>
+
+  <ul id="list"></ul>
+
+  <script>
+    const api = "/api/notes";
+
+    async function load() {
+      try {
+        const res = await fetch(api);
+        const notes = await res.json();
+        render(notes);
+        document.getElementById("status").textContent = `(${notes.length} notes, live)`;
+      } catch (e) {
+        document.getElementById("status").textContent = "(offline)";
+      }
+    }
+
+    function render(notes) {
+      const ul = document.getElementById("list");
+      ul.innerHTML = "";
+      for (const n of notes) {
+        const li = document.createElement("li");
+        const span = document.createElement("span");
+        span.textContent = n.text;
+        const edit = document.createElement("button");
+        edit.textContent = "Edit";
+        edit.onclick = () => update(n.id, n.text);
+        const del = document.createElement("button");
+        del.textContent = "Delete";
+        del.onclick = () => remove(n.id);
+        li.append(span, edit, del);
+        ul.appendChild(li);
+      }
+    }
+
+    async function create(text) {
+      await fetch(api, { method: "POST", body: JSON.stringify({ text }) });
+      load();
+    }
+    async function update(id, oldText) {
+      const text = prompt("Edit note:", oldText);
+      if (text === null) return;
+      await fetch(`${api}/${id}`, { method: "PUT", body: JSON.stringify({ text }) });
+      load();
+    }
+    async function remove(id) {
+      await fetch(`${api}/${id}`, { method: "DELETE" });
+      load();
+    }
+
+    document.getElementById("new").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = document.getElementById("text");
+      const text = input.value.trim();
+      if (text) { create(text); input.value = ""; }
+    });
+
+    // Poll every second for "realtime" updates across tabs.
+    load();
+    setInterval(load, 1000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+#!/usr/bin/env ran
+// Hardware prototyping demo (simulated with print + sleep).
+// Note: real GPIO/serial is not wired yet - see docs/08-hardware.md
+
+import "std::time" as time
+
+LED_PIN=13
+BUTTON_PIN=7
+
+fn main() {
+    echo "Hardware I/O demo (simulated)"
+    echo "LED pin: $LED_PIN"
+    echo "Button pin: $BUTTON_PIN"
+
+    // Blink LED 5 times
+    for i in [1, 2, 3, 4, 5] {
+        echo "Blink $i"
+        time.sleep(200)
+    }
+
+    echo "Done"
+}

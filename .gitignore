@@ -1,0 +1,43 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Ran build dumps + compiled example binaries (ran build --debug writes ./debug/*.txt)
+examples/**/target/
+examples/**/debug/
+examples/blog/blog
+examples/blog/app
+examples/website/app
+
+# IDE
+.cursor/
+.gemini/
+.claude/
+.codex/
+.idea/
+.kiro/
+.helix
+.nano/
+.zed/
+.nvim/
+.vi/
+.tmp_test/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ran compiled output
+*.ranc
+/output/
+/bin/
+
+# Environment
+.env
+config.json
+
+# experiments
+.tmp_tests/

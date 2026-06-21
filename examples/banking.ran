@@ -1,0 +1,63 @@
+# Bank transfer simulation — exact money, atomic-style transfer.
+# Demonstrates: struct + impl methods + decimal + overflow/overdraft safety.
+
+import "std::log" as log
+
+struct Account {
+    id: str,
+    owner: str,
+    balance: decimal,
+}
+
+impl Account {
+    fn open(id, owner, opening) -> Account {
+        return Account { id: id, owner: owner, balance: opening }
+    }
+    fn deposit(self, amount) -> Account {
+        return Account { id: self.id, owner: self.owner, balance: self.balance + amount }
+    }
+    fn can_withdraw(self, amount) -> bool {
+        return self.balance.cmp(amount) >= 0
+    }
+    fn withdraw(self, amount) -> Account {
+        return Account { id: self.id, owner: self.owner, balance: self.balance - amount }
+    }
+    fn show(self) -> str {
+        return self.owner + " (" + self.id + "): " + self.balance
+    }
+}
+
+# Transfer returns void on failure (rejected), printing why.
+#
+# Ownership note (strict mode): `from` and `to` are taken as immutable borrows
+# (`&Account`) so the caller keeps ownership of both accounts. Without the
+# borrows, passing the accounts by value would move them into `transfer`, and
+# the second transfer in `main` would be a use-after-move (E0210). Narrowing to
+# `&` is the idiomatic fix — `transfer` only needs to read the accounts.
+fn transfer(from: &Account, to: &Account, amount) {
+    if !from.can_withdraw(amount) {
+        log.error("transfer rejected: insufficient funds for", from.owner)
+        return
+    }
+    # Atomic in spirit: both legs computed before either is "committed".
+    let new_from = from.withdraw(amount)
+    let new_to = to.deposit(amount)
+    log.info("transferred", amount, "from", from.owner, "to", to.owner)
+    echo "  " + new_from.show()
+    echo "  " + new_to.show()
+}
+
+fn main() {
+    let alice = Account.open("ACC-1", "Alice", dec("1000.00"))
+    let bob = Account.open("ACC-2", "Bob", dec("50.00"))
+
+    echo "Initial:"
+    echo "  " + alice.show()
+    echo "  " + bob.show()
+
+    echo "Transfer 250.75 Alice -> Bob:"
+    transfer(&alice, &bob, dec("250.75"))
+
+    echo "Overdraft attempt 10000 Bob -> Alice:"
+    transfer(&bob, &alice, dec("10000.00"))
+}

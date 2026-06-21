@@ -1,0 +1,10 @@
+#!/usr/bin/env ran
+# Hello World — The simplest Ran program
+
+name="World"
+version="0.1.0"
+
+fn main() {
+    echo "Hello, $name!"
+    echo "Ran v$version"
+}

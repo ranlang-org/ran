@@ -1,0 +1,11 @@
+# app.ran - imports a local module
+# Run: ran app.ran
+
+import "./mathlib"
+
+fn main() {
+    let a = square(5)
+    let b = cube(3)
+    echo "square(5) = $a"
+    echo "cube(3) = $b"
+}

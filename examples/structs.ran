@@ -1,0 +1,30 @@
+#!/usr/bin/env ran
+# Structs & Enums
+
+pub struct User {
+    pub name: String,
+    pub age: int,
+    email: String,
+}
+
+pub enum Status {
+    Active,
+    Inactive,
+    Banned(String),
+}
+
+impl User {
+    fn new(name: String, age: int, email: String) -> User {
+        return User { name: name, age: age, email: email }
+    }
+
+    fn greet(&self) {
+        echo "Hi, I'm $self.name"
+    }
+}
+
+fn main() {
+    let user = User.new("Alice", 25, "alice@ran.dev")
+    user.greet()
+    echo "Age: $user.age"
+}
