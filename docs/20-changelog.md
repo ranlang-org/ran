@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.5 — Native SQLite (`db`) (D4b-3a)
+
+Backward-compatible. `ran build --native` now bridges the `db` (embedded SQLite)
+module via direct `libsqlite3` FFI in the C runtime — database programs build
+native. Verified: 395 tests green; default `ran build` unchanged. Summary in the
+root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Native `db`:** `connect/close/query/exec/begin/commit/rollback` matching the
+  interpreter — parameterized queries, rows as maps, base type mapping, and exact
+  decimal money as TEXT. Error parity `E0501`–`E0510` (handleable `E0505` constraint
+  with in-transaction auto-rollback). Links `-lsqlite3` only when `db` is imported.
+  Golden connect→exec→query→commit/rollback flow byte-for-byte equal to the
+  interpreter; ASan/UBSan clean.
+- **Still `E0606`:** `http`, `web`, `concurrency`, `crypto`, `decimal` module-form,
+  `os.meminfo`.
+
 ## 0.2.4 — Native map type, JSON decode & env (D4b-1)
 
 Backward-compatible. The native AOT runtime gained a reference-counted **map/dict

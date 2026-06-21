@@ -33,6 +33,39 @@ linked into native binaries; `--link-static`; making native the default once the
 subset matures. Phases E–G (compiler stdlib, the Ran-in-Ran compiler `ranc`, and
 the bootstrap fixed point that defines 1.0.0) follow.
 
+## [Unreleased]
+
+Next: native AOT — the HTTP client (TLS) and HTTP server, then `concurrency`
+(`spawn`/channels via pthreads), then completing and bridging `crypto`;
+`--link-static`; making native the default once the subset matures. (A known
+native-string refcount leak is to be fixed before the HTTP server, since a
+long-running server must not leak per request.) Phases E–G (compiler stdlib,
+the Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0)
+follow.
+
+## [0.2.5] — Native SQLite (`db`) (D4b-3a)
+
+Backward-compatible. The native AOT path can now build database programs:
+`ran build --native` bridges the `db` (embedded SQLite) module via direct
+`libsqlite3` FFI in the C runtime — the same system library the interpreter uses.
+Verified: 395 tests green; default `ran build` unchanged.
+
+### Added — native `db` (SQLite)
+
+- `db.connect/close/query/exec/begin/commit/rollback` compile to native, matching
+  the interpreter's API and semantics: parameterized queries, rows as maps, base
+  type mapping, and **exact decimal money stored as TEXT**. Error codes are at
+  parity (`E0501`–`E0510`, including handleable `E0505` constraint with
+  auto-rollback inside a transaction).
+- The native binary links `-lsqlite3` only when the program imports `db`
+  (`#ifdef`-gated runtime). Golden connect→exec→query→commit/rollback flow is
+  byte-for-byte identical to the interpreter; ASan/UBSan clean.
+
+### Still a hard `E0606` (deferred)
+
+- `http`, `web`, `concurrency`, `crypto`, `decimal` module-form, `os.meminfo`.
+  Never a silent fallback.
+
 ## [0.2.4] — Native map type, JSON decode & env (D4b-1)
 
 Backward-compatible. The native AOT runtime gained a reference-counted **map/dict

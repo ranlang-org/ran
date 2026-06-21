@@ -326,4 +326,31 @@ int64_t     ran_mod_env_load(const RanValue *argv, int64_t argc);
 int64_t     ran_mod_env_load_override(const RanValue *argv, int64_t argc);
 int64_t     ran_mod_env_load_default(const RanValue *argv, int64_t argc);
 
+/* db — embedded SQLite via the system libsqlite3 (D4b-3a).
+ *
+ * Compiled into the runtime ONLY when the program imports `std::db` (the build
+ * pipeline passes `-DRAN_ENABLE_SQLITE` and links `-lsqlite3` in that case);
+ * programs that never use `db` neither compile this section nor depend on the
+ * shared library. The declarations are always visible so the generated program
+ * type-checks, but they are defined only under `RAN_ENABLE_SQLITE`.
+ *
+ * Every function takes the boxed argument vector and returns a tagged RanValue:
+ * the success value (Int handle / Int affected-rows / Bool true / Array<Map>
+ * rows) OR a handleable error Map{error:true, code, message}, byte-for-byte
+ * matching the interpreter's `db` dispatch + `Environment::db_error_value`.
+ *
+ *   connect(path)             -> Int handle | error map (E0501/E0502)
+ *   close(handle)             -> Bool true   | error map (E0503)
+ *   query(handle, sql, params)-> Array<Map>  | error map (E0503/4/6/7)
+ *   exec(handle, sql, params) -> Int affected | error map (E0503/4/5/6/7)
+ *   begin/commit/rollback(h)  -> Bool true   | error map (E0503/E0509/E0510)
+ */
+RanValue ran_mod_db_connect(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_close(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_query(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_exec(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_begin(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_commit(const RanValue *argv, int64_t argc);
+RanValue ran_mod_db_rollback(const RanValue *argv, int64_t argc);
+
 #endif /* RAN_RT_H */

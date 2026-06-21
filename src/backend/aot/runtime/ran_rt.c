@@ -2512,3 +2512,453 @@ int64_t ran_mod_env_load_default(const RanValue *argv, int64_t argc) {
     (void)argv; (void)argc;
     return env_load_dotenv(".env", false);
 }
+
+/* ====================================================================== */
+/* db — embedded SQLite via the system libsqlite3 (D4b-3a).               */
+/*                                                                        */
+/* Compiled in ONLY when the program imports `std::db` (the build pipeline */
+/* passes -DRAN_ENABLE_SQLITE and links -lsqlite3). This is the same system */
+/* library the interpreter reaches through FFI; here it is used naturally   */
+/* from C via `#include <sqlite3.h>`. The semantics MATCH the interpreter's  */
+/* `db` dispatch (src/runtime/module_dispatch.rs), its value mapping         */
+/* (src/runtime/helpers/db.rs), and the FFI lifecycle layer                  */
+/* (src/support/sqlite_ffi.rs) exactly:                                      */
+/*                                                                          */
+/*   * connection handles are opaque monotonic Int ids (start at 1) into a   */
+/*     process-global registry; a closed/unknown handle yields E0503;        */
+/*   * parameters are ALWAYS bound (never interpolated): int/float/str/      */
+/*     decimal/void map to bind_int64/double/text/text(exact-decimal)/null;  */
+/*     any other Ran value as a bind parameter is E0507;                     */
+/*   * a parameter-count mismatch is E0506 (checked before executing);       */
+/*   * read mapping: INTEGER->int, REAL->float, TEXT->str, NULL->void; a     */
+/*     BLOB or other column type aborts the read with E0507;                 */
+/*   * money is exact-decimal TEXT — a `decimal` bind value is stored via    */
+/*     the canonical Decimal `Display` (dec_to_str, no rounding), and read   */
+/*     back as the TEXT str, exactly as the interpreter does (db.query uses   */
+/*     the base mapping, so a money column round-trips as str);              */
+/*   * open errors classify to E0501 (access/permission) / E0502 (not a      */
+/*     SQLite database); a SQL error is E0504; a constraint violation is the */
+/*     handleable E0505 (auto-rolling-back an active transaction);           */
+/*   * begin on an active tx is E0509; commit/rollback with none is E0510.   */
+/*                                                                          */
+/* Every function returns a tagged RanValue: the success value OR a          */
+/* handleable error Map{error:true, code, message}, and prints the same      */
+/* diagnostic to stderr that the interpreter's `db_error_value` does. The    */
+/* native program therefore observes byte-for-byte identical stdout.         */
+/*                                                                          */
+/* Divergence (documented): the interpreter checks libsqlite3 availability   */
+/* at runtime (dlopen) and returns E0501 if absent; the native binary links  */
+/* libsqlite3 directly, so an absent library is a link/load-time condition   */
+/* rather than a runtime E0501. The not-a-database (E0502), permission       */
+/* (E0501), and all SQL/constraint/transaction codes are produced at runtime */
+/* identically. */
+/* ====================================================================== */
+#ifdef RAN_ENABLE_SQLITE
+#include <sqlite3.h>
+
+/* One open connection in the process-global registry. */
+typedef struct {
+    int64_t  id;     /* opaque handle id (>=1); slot is free when valid==0 && db==NULL */
+    sqlite3 *db;
+    int      in_tx;  /* 1 while a transaction is active */
+    int      valid;  /* 1 while the handle is usable */
+} RanDbConn;
+
+static RanDbConn *g_db_conns = NULL;
+static size_t     g_db_len   = 0;
+static size_t     g_db_cap   = 0;
+static int64_t    g_db_next  = 1;   /* monotonic handle ids; start at 1 (matches interp) */
+
+/* The catalog hint for a db diagnostic code (mirrors diagnostics.rs E05xx). */
+static const char *db_hint(const char *code) {
+    if (!strcmp(code, "E0501")) return "Periksa izin file/direktori database pada path tersebut.";
+    if (!strcmp(code, "E0502")) return "File bukan database SQLite yang valid. Periksa path atau hapus file rusak.";
+    if (!strcmp(code, "E0503")) return "Handle koneksi tidak valid. Gunakan handle dari `db.connect` yang masih terbuka.";
+    if (!strcmp(code, "E0504")) return "Perbaiki SQL: <pesan dari SQLite>.";
+    if (!strcmp(code, "E0505")) return "Perintah melanggar constraint: <pesan dari SQLite>. Sesuaikan data.";
+    if (!strcmp(code, "E0506")) return "Jumlah parameter (<n>) tidak sama dengan placeholder (<m>). Samakan jumlahnya.";
+    if (!strcmp(code, "E0507")) return "Tipe kolom <tipe> tidak didukung. Pilih INTEGER/REAL/TEXT/NULL atau simpan sebagai TEXT.";
+    if (!strcmp(code, "E0508")) return "Nilai moneter tidak dapat di-parse sebagai decimal. Simpan sebagai TEXT desimal yang valid.";
+    if (!strcmp(code, "E0509")) return "Transaksi sudah aktif. Commit/rollback dulu sebelum `db.begin` lagi.";
+    if (!strcmp(code, "E0510")) return "Tidak ada transaksi aktif. Panggil `db.begin` sebelum commit/rollback.";
+    return "";
+}
+
+/* Build a handleable error value AND emit the diagnostic to stderr — exactly
+ * mirroring Environment::db_error_value (same ANSI format + catalog hint). The
+ * map carries {error:true, code, message}; the program keeps running. */
+static RanValue db_error(const char *code, const char *msg) {
+    const char *hint = db_hint(code);
+    fflush(stdout);
+    fprintf(stderr, "\x1b[31;1merror\x1b[0m[%s]: %s\n", code, msg ? msg : "");
+    if (hint && *hint) fprintf(stderr, "  \x1b[36m= help\x1b[0m: %s\n", hint);
+    RanValue m = ran_map_new();
+    ran_map_set(m, "error", ran_from_bool(true));
+    ran_map_set(m, "code", ran_from_str(code));
+    ran_map_set(m, "message", ran_from_str(msg ? msg : ""));
+    return m;
+}
+
+/* Classify a result code from opening a database (mirrors classify_open_error). */
+static RanValue db_classify_open(int rc, sqlite3 *db, const char *path) {
+    const char *sm = db ? sqlite3_errmsg(db) : "";
+    char msg[512];
+    switch (rc) {
+        case SQLITE_NOTADB:
+        case SQLITE_CORRUPT:
+            snprintf(msg, sizeof msg, "`%s` bukan database SQLite yang valid: %s", path, sm);
+            return db_error("E0502", msg);
+        case SQLITE_CANTOPEN:
+        case SQLITE_PERM:
+        case SQLITE_READONLY:
+        case SQLITE_AUTH:
+        case SQLITE_BUSY:
+            snprintf(msg, sizeof msg, "tidak dapat mengakses database `%s`: %s", path, sm);
+            return db_error("E0501", msg);
+        default:
+            snprintf(msg, sizeof msg, "gagal membuka database `%s` (rc=%d): %s", path, rc, sm);
+            return db_error("E0501", msg);
+    }
+}
+
+/* Classify a result code from a statement (mirrors classify_stmt_error): a
+ * constraint violation (low byte 19) -> handleable E0505; corruption/not-a-db
+ * -> E0502; access -> E0501; everything else -> E0504. */
+static RanValue db_classify_stmt(int rc, const char *sm) {
+    char msg[512];
+    if (!sm) sm = "";
+    if ((rc & 0xff) == SQLITE_CONSTRAINT) {
+        snprintf(msg, sizeof msg, "perintah melanggar constraint: %s", sm);
+        return db_error("E0505", msg);
+    }
+    switch (rc) {
+        case SQLITE_NOTADB:
+        case SQLITE_CORRUPT:
+            snprintf(msg, sizeof msg, "bukan database SQLite yang valid: %s", sm);
+            return db_error("E0502", msg);
+        case SQLITE_CANTOPEN:
+        case SQLITE_PERM:
+        case SQLITE_READONLY:
+        case SQLITE_AUTH:
+            snprintf(msg, sizeof msg, "akses database ditolak: %s", sm);
+            return db_error("E0501", msg);
+        default:
+            snprintf(msg, sizeof msg, "kesalahan SQLite (rc=%d): %s", rc, sm);
+            return db_error("E0504", msg);
+    }
+}
+
+/* Human-readable column-type label (mirrors sqlite_type_name). */
+static const char *db_coltype_name(int t) {
+    switch (t) {
+        case SQLITE_INTEGER: return "INTEGER";
+        case SQLITE_FLOAT:   return "REAL";
+        case SQLITE_TEXT:    return "TEXT";
+        case SQLITE_BLOB:    return "BLOB";
+        case SQLITE_NULL:    return "NULL";
+        default:             return "tidak dikenal";
+    }
+}
+
+/* E0507 for an unsupported bind-parameter type (mirrors db_param_type_error). */
+static RanValue db_param_type_err_for(RanValue v) {
+    const char *kind;
+    switch (v.tag) {
+        case RAN_BOOL:   kind = "bool"; break;
+        case RAN_ARRAY:  kind = "array"; break;
+        case RAN_MAP:    kind = "map"; break;
+        case RAN_OBJECT: kind = (v.u.o && v.u.o->type_name) ? v.u.o->type_name : "object"; break;
+        default:         kind = "nilai"; break;
+    }
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "tipe parameter `%s` tidak didukung sebagai bind value; gunakan int/float/str/decimal/void",
+             kind);
+    return db_error("E0507", msg);
+}
+
+/* Validate every bind parameter's type up front (mirrors eval_db_params):
+ * Array elements / Void are fine; a non-array, non-void params argument or any
+ * element outside int/float/str/decimal/void yields E0507 via *err. Returns 1
+ * if an error was produced. This runs BEFORE the handle lookup, matching the
+ * interpreter's evaluation order (param eval precedes the registry lookup). */
+static int db_check_params(RanValue params, RanValue *err) {
+    if (params.tag == RAN_VOID) return 0;
+    if (params.tag != RAN_ARRAY) {
+        *err = db_param_type_err_for(params);
+        return 1;
+    }
+    for (size_t i = 0; i < params.u.a->len; i++) {
+        RanValue p = params.u.a->items[i];
+        switch (p.tag) {
+            case RAN_INT:
+            case RAN_FLOAT:
+            case RAN_STR:
+            case RAN_DEC:
+            case RAN_VOID:
+                break;
+            default:
+                *err = db_param_type_err_for(p);
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* Look up a live connection by handle id, or NULL (closed/unknown -> E0503). */
+static RanDbConn *db_reg_get(int64_t id) {
+    if (id <= 0) return NULL;
+    for (size_t i = 0; i < g_db_len; i++) {
+        if (g_db_conns[i].id == id && g_db_conns[i].valid) return &g_db_conns[i];
+    }
+    return NULL;
+}
+
+/* Register an open connection, returning its fresh opaque handle id. */
+static int64_t db_reg_add(sqlite3 *db) {
+    RanDbConn *slot = NULL;
+    for (size_t i = 0; i < g_db_len; i++) {
+        if (!g_db_conns[i].valid && g_db_conns[i].db == NULL) { slot = &g_db_conns[i]; break; }
+    }
+    if (!slot) {
+        if (g_db_len == g_db_cap) {
+            size_t ncap = g_db_cap ? g_db_cap * 2 : 4;
+            RanDbConn *n = (RanDbConn *)ran_xalloc(ncap * sizeof(RanDbConn));
+            if (g_db_conns) { memcpy(n, g_db_conns, g_db_len * sizeof(RanDbConn)); free(g_db_conns); }
+            g_db_conns = n;
+            g_db_cap = ncap;
+        }
+        slot = &g_db_conns[g_db_len++];
+    }
+    int64_t id = g_db_next++;
+    slot->id = id;
+    slot->db = db;
+    slot->in_tx = 0;
+    slot->valid = 1;
+    return id;
+}
+
+/* Prepare `sql` and bind `params` (already type-checked). On any failure sets
+ * *err and returns NULL (statement finalized): invalid SQL -> E0504, a
+ * param-count mismatch -> E0506 (before binding/executing), a failing bind ->
+ * classified error. Parameters are bound positionally; a decimal is bound as
+ * its exact-decimal TEXT (dec_to_str), TEXT by pointer+length (transient). */
+static sqlite3_stmt *db_prepare_bind(RanDbConn *c, const char *sql, RanValue params, RanValue *err) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(c->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        *err = db_classify_stmt(rc, sqlite3_errmsg(c->db));
+        if (stmt) sqlite3_finalize(stmt);
+        return NULL;
+    }
+    int expected = sqlite3_bind_parameter_count(stmt);
+    size_t np = (params.tag == RAN_ARRAY) ? params.u.a->len : 0;
+    if ((int)np != expected) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "Jumlah parameter (%zu) tidak sama dengan placeholder (%d).", np, expected);
+        *err = db_error("E0506", msg);
+        sqlite3_finalize(stmt);
+        return NULL;
+    }
+    for (size_t i = 0; i < np; i++) {
+        RanValue p = params.u.a->items[i];
+        int pos = (int)i + 1;
+        int brc;
+        switch (p.tag) {
+            case RAN_VOID:  brc = sqlite3_bind_null(stmt, pos); break;
+            case RAN_INT:   brc = sqlite3_bind_int64(stmt, pos, (sqlite3_int64)p.u.i); break;
+            case RAN_FLOAT: brc = sqlite3_bind_double(stmt, pos, p.u.f); break;
+            case RAN_STR:
+                brc = sqlite3_bind_text(stmt, pos, p.u.s->data, (int)p.u.s->len, SQLITE_TRANSIENT);
+                break;
+            case RAN_DEC: {
+                Dec d;
+                d.mant = p.u.dec.mant;
+                d.scale = p.u.dec.scale;
+                const char *s = dec_to_str(d); /* exact decimal text, no rounding */
+                brc = sqlite3_bind_text(stmt, pos, s, -1, SQLITE_TRANSIENT);
+                /* SQLITE_TRANSIENT made SQLite copy the bytes immediately, so the
+                 * heap text from dec_to_str can be released right away. */
+                free((void *)s);
+                break;
+            }
+            default: brc = SQLITE_ERROR; break; /* unreachable: db_check_params filtered */
+        }
+        if (brc != SQLITE_OK) {
+            *err = db_classify_stmt(brc, sqlite3_errmsg(c->db));
+            sqlite3_finalize(stmt);
+            return NULL;
+        }
+    }
+    return stmt;
+}
+
+RanValue ran_mod_db_connect(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        RanValue e = db_classify_open(rc, db, path);
+        if (db) sqlite3_close_v2(db);
+        return e;
+    }
+    /* Enable WAL (open decision #4) — also forces SQLite to read the file
+     * header, surfacing E0502 (SQLITE_NOTADB) for a file that is not a db. */
+    char *em = NULL;
+    rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &em);
+    if (rc != SQLITE_OK) {
+        RanValue e = db_classify_stmt(rc, em ? em : sqlite3_errmsg(db));
+        if (em) sqlite3_free(em);
+        sqlite3_close_v2(db);
+        return e;
+    }
+    if (em) sqlite3_free(em);
+    return ran_from_int(db_reg_add(db));
+}
+
+RanValue ran_mod_db_close(const RanValue *argv, int64_t argc) {
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+    /* Roll back any in-flight transaction so closing never silently commits. */
+    if (c->in_tx) {
+        sqlite3_exec(c->db, "ROLLBACK;", NULL, NULL, NULL);
+        c->in_tx = 0;
+    }
+    if (c->db) {
+        sqlite3_close_v2(c->db);
+        c->db = NULL;
+    }
+    c->valid = 0; /* handle is now invalid; later use -> E0503 */
+    return ran_from_bool(true);
+}
+
+RanValue ran_mod_db_query(const RanValue *argv, int64_t argc) {
+    RanValue params = marg_val(argv, argc, 2);
+    RanValue err;
+    if (db_check_params(params, &err)) return err; /* E0507 before handle lookup */
+
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+
+    const char *sql = marg_str(argv, argc, 1, "");
+    sqlite3_stmt *stmt = db_prepare_bind(c, sql, params, &err);
+    if (!stmt) return err;
+
+    int ncol = sqlite3_column_count(stmt);
+    RanValue rows = ran_array_new(0);
+    for (;;) {
+        int sr = sqlite3_step(stmt);
+        if (sr == SQLITE_ROW) {
+            RanValue m = ran_map_new();
+            for (int i = 0; i < ncol; i++) {
+                const char *name = sqlite3_column_name(stmt, i);
+                int ct = sqlite3_column_type(stmt, i);
+                RanValue val;
+                if (ct == SQLITE_INTEGER) {
+                    val = ran_from_int((int64_t)sqlite3_column_int64(stmt, i));
+                } else if (ct == SQLITE_FLOAT) {
+                    val = ran_from_float(sqlite3_column_double(stmt, i));
+                } else if (ct == SQLITE_TEXT) {
+                    val = ran_from_str((const char *)sqlite3_column_text(stmt, i));
+                } else if (ct == SQLITE_NULL) {
+                    val = ran_void();
+                } else {
+                    /* BLOB or any other type -> abort the read (E0507). */
+                    char msg[192];
+                    snprintf(msg, sizeof msg, "tipe kolom `%s` (kolom `%s`) tidak didukung",
+                             db_coltype_name(ct), name ? name : "");
+                    ran_release(m);
+                    ran_release(rows);
+                    sqlite3_finalize(stmt);
+                    return db_error("E0507", msg);
+                }
+                ran_map_set(m, name ? name : "", val);
+            }
+            ran_array_push(rows, m);
+        } else if (sr == SQLITE_DONE) {
+            break;
+        } else {
+            RanValue e = db_classify_stmt(sr, sqlite3_errmsg(c->db));
+            sqlite3_finalize(stmt);
+            ran_release(rows);
+            return e;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
+RanValue ran_mod_db_exec(const RanValue *argv, int64_t argc) {
+    RanValue params = marg_val(argv, argc, 2);
+    RanValue err;
+    if (db_check_params(params, &err)) return err; /* E0507 before handle lookup */
+
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+
+    const char *sql = marg_str(argv, argc, 1, "");
+    sqlite3_stmt *stmt = db_prepare_bind(c, sql, params, &err);
+    if (!stmt) return err;
+
+    for (;;) {
+        int sr = sqlite3_step(stmt);
+        if (sr == SQLITE_ROW) continue; /* a write/DDL stmt should not yield rows */
+        if (sr == SQLITE_DONE) break;
+        /* Build the error before finalize (errmsg is connection-owned). */
+        RanValue e = db_classify_stmt(sr, sqlite3_errmsg(c->db));
+        sqlite3_finalize(stmt);
+        /* Auto-rollback (R6.7/R8.6): a constraint violation inside an active
+         * transaction rolls the whole transaction back to its pre-begin state
+         * and clears the flag; the handleable E0505 is still returned. */
+        if ((sr & 0xff) == SQLITE_CONSTRAINT && c->in_tx) {
+            sqlite3_exec(c->db, "ROLLBACK;", NULL, NULL, NULL);
+            c->in_tx = 0;
+        }
+        return e;
+    }
+    int64_t affected = (int64_t)sqlite3_changes(c->db);
+    sqlite3_finalize(stmt);
+    return ran_from_int(affected);
+}
+
+RanValue ran_mod_db_begin(const RanValue *argv, int64_t argc) {
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+    if (c->in_tx)
+        return db_error("E0509", "Transaksi sudah aktif; commit/rollback dulu sebelum begin lagi");
+    int rc = sqlite3_exec(c->db, "BEGIN;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return db_classify_stmt(rc, sqlite3_errmsg(c->db));
+    c->in_tx = 1;
+    return ran_from_bool(true);
+}
+
+RanValue ran_mod_db_commit(const RanValue *argv, int64_t argc) {
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+    if (!c->in_tx)
+        return db_error("E0510", "Tidak ada transaksi aktif; panggil begin sebelum commit/rollback");
+    int rc = sqlite3_exec(c->db, "COMMIT;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return db_classify_stmt(rc, sqlite3_errmsg(c->db));
+    c->in_tx = 0;
+    return ran_from_bool(true);
+}
+
+RanValue ran_mod_db_rollback(const RanValue *argv, int64_t argc) {
+    int64_t id = marg_int(argv, argc, 0, 0);
+    RanDbConn *c = db_reg_get(id);
+    if (!c) return db_error("E0503", "Handle koneksi sudah ditutup atau tidak valid");
+    if (!c->in_tx)
+        return db_error("E0510", "Tidak ada transaksi aktif; panggil begin sebelum commit/rollback");
+    int rc = sqlite3_exec(c->db, "ROLLBACK;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return db_classify_stmt(rc, sqlite3_errmsg(c->db));
+    c->in_tx = 0;
+    return ran_from_bool(true);
+}
+
+#endif /* RAN_ENABLE_SQLITE */

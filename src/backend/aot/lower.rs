@@ -82,10 +82,24 @@ fn real_module_name(path: &str) -> String {
 
 /// The stdlib modules bridged into native code. D4a added time/log/math/str/
 /// os/fs/rand/json(encode side); D4b-1 completes `json` (decode/parse/get/valid)
-/// and adds `env` (environment + dotenv). Heavier modules (`http`, `db`, `web`,
-/// `concurrency`, `crypto`, `decimal`-as-module) remain a hard E0606.
+/// and adds `env` (environment + dotenv); D4b-3a adds `db` (embedded SQLite via
+/// the system `libsqlite3`). Heavier modules (`http`, `web`, `concurrency`,
+/// `crypto`, `decimal`-as-module) remain a hard E0606.
 fn is_bridged_module(m: &str) -> bool {
-    matches!(m, "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json" | "env")
+    matches!(
+        m,
+        "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json" | "env" | "db"
+    )
+}
+
+/// Whether the program imports the `db` (SQLite) module. The build pipeline uses
+/// this to decide whether to add `-lsqlite3` to the native link step (and the
+/// `-DRAN_ENABLE_SQLITE` define that compiles the db section of the C runtime);
+/// programs that never touch `db` link nothing extra.
+pub fn program_uses_module(checked: &CheckedProgram, module: &str) -> bool {
+    checked.program.statements.iter().any(|s| {
+        matches!(&s.kind, Statement::Import { path, .. } if real_module_name(path) == module)
+    })
 }
 
 /// Collect import alias -> module name for every `import` in the program
@@ -180,6 +194,16 @@ fn bridged_method_ret(module: &str, method: &str) -> Option<Option<CType>> {
         ("env", "all") => Some(Value),       // map
         ("env", "load") | ("env", "load_override") | ("env", "load_default") => Some(Int),
 
+        // --- db (embedded SQLite; D4b-3a). Every method returns a tagged
+        //     RanValue: the success value (Int handle / Int affected-rows /
+        //     Bool true / Array<Map> rows) OR a handleable error Map
+        //     {error, code, message}, exactly like the interpreter's dispatch
+        //     (which yields `Self::db_error_value(..)` on any DbError). Because
+        //     a single call site can produce either shape, the static native
+        //     type is `Value` for all of them. ---
+        ("db", "connect") | ("db", "close") | ("db", "query") | ("db", "exec")
+        | ("db", "begin") | ("db", "commit") | ("db", "rollback") => Some(Value),
+
         _ => return None,
     };
     Some(r)
@@ -263,7 +287,7 @@ fn unsupported(file: &str, span_line: usize, span_col: usize, what: &str) -> Dia
         .with_help(
             "this construct is outside the native subset (functions, control flow, \
              int/float/bool/str, decimal, arrays, structs, maps, match, and the \
-             bridged stdlib modules time/log/math/str/os/fs/rand/json/env); build \
+             bridged stdlib modules time/log/math/str/os/fs/rand/json/env/db); build \
              without `--native` to use the interpreter-backed binary, or wait for a \
              later native iteration",
         )
@@ -315,7 +339,7 @@ pub fn supported(checked: &CheckedProgram, file: &str) -> Result<(), Diagnostic>
                         stmt.span.col,
                         &format!(
                             "import of module `{}` (bridged native modules are \
-                             time, log, math, str, os, fs, rand, json)",
+                             time, log, math, str, os, fs, rand, json, env, db)",
                             module
                         ),
                     ));
@@ -2492,5 +2516,74 @@ fn main() {
         assert!(c.contains("hello $missing world"), "unknown name kept literal:\n{c}");
         // No interpolation machinery is emitted for a fully-literal string.
         assert!(!c.contains("ran_interp_path"), "no runtime path resolution:\n{c}");
+    }
+
+    // ---- D4b-3a: db (SQLite) bridge. ---------------------------------------
+
+    #[test]
+    fn supported_accepts_db_import_and_methods() {
+        // `import "std::db"` plus connect/exec/query/begin/commit/rollback/close
+        // are all inside the native subset (each lowers to a ran_mod_db_* call).
+        let src = r#"
+import "std::db" as db
+fn main() {
+    let conn = db.connect("x.db")
+    db.exec(conn, "CREATE TABLE t (id INTEGER, amt TEXT)", [])
+    db.exec(conn, "INSERT INTO t (id, amt) VALUES (?, ?)", [1, dec("9.99")])
+    let rows = db.query(conn, "SELECT id, amt FROM t WHERE id > ?", [0])
+    let n = len(rows)
+    echo "n=$n"
+    db.begin(conn)
+    db.commit(conn)
+    db.begin(conn)
+    db.rollback(conn)
+    db.close(conn)
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").expect("db module is in the D4b-3a subset");
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("ran_mod_db_connect("), "db.connect lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_exec("), "db.exec lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_query("), "db.query lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_begin("), "db.begin lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_commit("), "db.commit lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_rollback("), "db.rollback lowered:\n{c}");
+        assert!(c.contains("ran_mod_db_close("), "db.close lowered:\n{c}");
+    }
+
+    #[test]
+    fn program_uses_module_detects_db() {
+        let with_db = check(
+            r#"
+import "std::db" as db
+fn main() { let c = db.connect("x.db") echo "ok" }
+"#,
+        );
+        assert!(program_uses_module(&with_db, "db"), "db import must be detected");
+
+        let without_db = check(
+            r#"
+import "std::time" as time
+fn main() { echo time.now_ms() }
+"#,
+        );
+        assert!(!program_uses_module(&without_db, "db"), "no db import here");
+    }
+
+    #[test]
+    fn supported_rejects_unbridged_module_still_e0606() {
+        // A still-unbridged module (e.g. http) remains a hard E0606 even though
+        // db is now accepted — the bridge is additive, not a blanket opening.
+        let src = r#"
+import "std::http" as http
+fn main() {
+    let r = http.get("https://example.com")
+    echo "x"
+}
+"#;
+        let checked = check(src);
+        let err = supported(&checked, "test.ran").expect_err("http is not bridged");
+        assert_eq!(err.code.as_deref(), Some("E0606"));
     }
 }

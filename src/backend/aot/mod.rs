@@ -93,6 +93,13 @@ pub fn compile_native(
     // 1. Pre-flight: hard-reject anything outside the D1 subset (E0606).
     lower::supported(checked, file)?;
 
+    // Does the program use the `db` (SQLite) module? If so, the C runtime's db
+    // section is compiled in (`-DRAN_ENABLE_SQLITE`) and the system `libsqlite3`
+    // is linked (`-lsqlite3`). Programs that never import `db` link nothing extra
+    // and the db section is not even compiled — keeping the artifact lean and
+    // free of an unnecessary shared-library dependency.
+    let uses_db = lower::program_uses_module(checked, "db");
+
     // 2. Lower to C (E0602 on failure).
     let c_source = lower::lower(checked, file)?;
 
@@ -123,8 +130,11 @@ pub fn compile_native(
     write_file(&rt_c_path, RAN_RT_C.as_bytes(), file)?;
 
     // 5. Compile the generated program and the runtime to object files (E0603).
-    compile_object(&cc, &c_path, &obj_prog, &build_dir, file)?;
-    compile_object(&cc, &rt_c_path, &obj_rt, &build_dir, file)?;
+    //    When `db` is used, both are compiled with `-DRAN_ENABLE_SQLITE` so the
+    //    runtime's SQLite section is included and `<sqlite3.h>` is in scope.
+    let defines: &[&str] = if uses_db { &["RAN_ENABLE_SQLITE"] } else { &[] };
+    compile_object(&cc, &c_path, &obj_prog, &build_dir, file, defines)?;
+    compile_object(&cc, &rt_c_path, &obj_rt, &build_dir, file, defines)?;
 
     // 6. Link to a temp path, then atomically rename onto `out` (E0604).
     let tmp_out = build_dir.join(format!(".{}.tmp-{}", name, std::process::id()));
@@ -136,6 +146,14 @@ pub fn compile_native(
         .arg(&tmp_out)
         // D2's runtime uses libm (pow/fmod/isnan) for float + decimal display.
         .arg("-lm");
+    if uses_db {
+        // The db module is implemented in the C runtime via direct libsqlite3
+        // FFI (`#include <sqlite3.h>`); link the system library. Dynamic linking
+        // is used here (the same system library the interpreter reaches via
+        // dlopen); a fully static archive is a later task (13.3). Placed after
+        // the objects so the linker resolves the runtime's sqlite3_* references.
+        link_cmd.arg("-lsqlite3");
+    }
     if opts.link_static {
         // D1 links nothing beyond the C runtime; `-static` is harmless here and
         // makes the intent explicit. Full static-lib wiring is task 13.3.
@@ -187,11 +205,16 @@ fn compile_object(
     obj: &Path,
     build_dir: &Path,
     file: &str,
+    defines: &[&str],
 ) -> Result<(), Diagnostic> {
-    let out = Command::new(cc)
-        .arg("-O2")
+    let mut cmd = Command::new(cc);
+    cmd.arg("-O2")
         .arg("-std=c11")
-        .arg(format!("-I{}", build_dir.display()))
+        .arg(format!("-I{}", build_dir.display()));
+    for d in defines {
+        cmd.arg(format!("-D{}", d));
+    }
+    let out = cmd
         .arg("-c")
         .arg(src)
         .arg("-o")
