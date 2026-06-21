@@ -11,7 +11,7 @@ Ran is bootstrapped with the Rust toolchain. You only need Rust for the initial 
 once compiled, the `ran` binary is self-contained.
 
 ```bash
-git clone https://github.com/user/ran
+git clone https://github.com/ranlang-org/ran
 cd ran
 cargo build --release
 
@@ -26,7 +26,7 @@ ran version
 # ran v0.2.1
 # The Ran Programming Language
 # A self-hosted language for internal systems and business tooling.
-# Engine: tree-walking interpreter
+# Engine: bytecode VM (default) with tree-walking interpreter fallback
 ```
 
 If you see the version banner, you are ready to go.

@@ -102,7 +102,7 @@ import "../shared/money.ran" as money
 ## Install
 
 ```fish
-git clone https://github.com/you/ran
+git clone https://github.com/ranlang-org/ran
 cd ran
 cargo build --release
 cp target/release/ran ~/.local/bin/

@@ -1244,7 +1244,7 @@ fn cmd_version() {
     println!("ran v0.2.1");
     println!("The Ran Programming Language");
     println!("A self-hosted language for internal systems and business tooling.");
-    println!("Engine: tree-walking interpreter (bytecode VM target in progress)");
+    println!("Engine: bytecode VM (default) with tree-walking interpreter fallback");
 }
 
 fn print_usage() {
