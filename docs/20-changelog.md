@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.3 — Native string interpolation + stdlib bridge (D3 / D4a)
+
+Backward-compatible. `ran build --native` gained **general string interpolation**
+and a **standard-library bridge**, so real programs (with `import`s and module
+calls) now compile to native machine code. The default `ran build` is unchanged.
+Verified: 391 tests green. Summary also in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Native string interpolation (D3):** interpolated string literals (`"x=$x"`,
+  `"${total}"`, dotted `"$acc.owner"`) work anywhere in native code, not just in
+  `echo` — byte-for-byte identical to the interpreter (incl. unknown-name-left-literal).
+- **Native stdlib bridge (D4a):** `import` + method calls compile to native for
+  `time`, `log`, `math`, `str`, `os`, `fs`, `rand`, `json` (encode/stringify/pretty),
+  implemented in the C runtime (`libran_rt`, libc/libm only). Deterministic functions
+  are byte-for-byte equal to the interpreter; nondeterministic ones (time/rand/log
+  timestamp/pid) match format/shape/type. Variadic `log.*` matches the interpreter's
+  line format. A real program with a big int-sum loop + `time.now_ms()` + `log.info`
+  now builds native and runs the hot loop as native `int64`.
+- **Still `E0606` (D4b):** `http`, `db`, `web`, `concurrency`, `crypto`, `env`, `html`,
+  `decimal` module-form; and `json.decode/parse/get`, `os.meminfo` (need a native map
+  type). Never a silent fallback.
+
 ## 0.2.2 — Memory-safe self-hosting (Phases A–C) + native AOT codegen (D1–D2)
 
 Tracked under the `memory-safe-self-hosting` effort. **Phases A, B, and C are

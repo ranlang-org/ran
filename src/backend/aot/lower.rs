@@ -64,6 +64,133 @@ struct FnSig {
 /// Struct definitions: type name -> ordered field names.
 type StructDefs = HashMap<String, Vec<String>>;
 
+/// Import aliases for bridged stdlib modules: alias -> real module name
+/// (e.g. `import "std::time" as t` -> {"t": "time"}). Populated from the
+/// program's `import` statements; only used to recognize and lower module
+/// method calls (`t.now_ms()` -> `ran_mod_time_now_ms(...)`).
+type ModAliases = HashMap<String, String>;
+
+// ===========================================================================
+// D4a: stdlib bridge — the COMMON modules implemented in the C runtime.
+// ===========================================================================
+
+/// Map an import path to its runtime module name: `std::time` -> `time`
+/// (mirrors `runtime::real_module_name`).
+fn real_module_name(path: &str) -> String {
+    path.strip_prefix("std::").unwrap_or(path).to_string()
+}
+
+/// The stdlib modules bridged into native code in D4a. Heavier modules
+/// (`http`, `db`, `web`, `concurrency`, `crypto`, `decimal`-as-module, `env`)
+/// remain a hard E0606 until D4b.
+fn is_bridged_module(m: &str) -> bool {
+    matches!(m, "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json")
+}
+
+/// Collect import alias -> module name for every `import` in the program
+/// (bridged or not — non-bridged imports are rejected separately so we still
+/// produce a precise "module method not bridged" message when one is called).
+fn collect_mod_aliases(checked: &CheckedProgram) -> ModAliases {
+    let mut m = HashMap::new();
+    for s in &checked.program.statements {
+        if let Statement::Import { path, alias } = &s.kind {
+            let module = real_module_name(path);
+            let key = alias.clone().unwrap_or_else(|| module.clone());
+            m.insert(key, module);
+        }
+    }
+    m
+}
+
+/// The native return type of a bridged `module.method`, if it is bridged.
+///
+/// Returns:
+///   * `Some(Some(ctype))` — bridged, returns a value of `ctype`;
+///   * `Some(None)`        — bridged, returns nothing (void: `log.*`, `time.sleep`, `os.exit`);
+///   * `None`              — NOT bridged (caller raises E0606).
+///
+/// `CType::Value` is used for functions whose result type depends on the
+/// argument (`math.abs/max/min`), or that may be a string OR void (`os.env`,
+/// `fs.read`), or that build heap data (`str.split`, `fs.readdir`, `os.args`).
+fn bridged_method_ret(module: &str, method: &str) -> Option<Option<CType>> {
+    use CType::*;
+    let r: Option<CType> = match (module, method) {
+        // --- time ---
+        ("time", "now") | ("time", "now_ms") => Some(Int),
+        ("time", "now_iso") => Some(Str),
+        ("time", "sleep") => None,
+
+        // --- log (variadic; all void; fatal exits) ---
+        ("log", "debug") | ("log", "info") | ("log", "warn") | ("log", "error")
+        | ("log", "fatal") => None,
+
+        // --- math ---
+        ("math", "abs") | ("math", "max") | ("math", "min") => Some(Value),
+        ("math", "sqrt") | ("math", "pow") | ("math", "sin") | ("math", "cos")
+        | ("math", "tan") | ("math", "log") | ("math", "log10") | ("math", "pi")
+        | ("math", "e") => Some(Float),
+        ("math", "floor") | ("math", "ceil") | ("math", "round") => Some(Int),
+
+        // --- str ---
+        ("str", "from") | ("str", "upper") | ("str", "lower") | ("str", "trim")
+        | ("str", "replace") | ("str", "join") | ("str", "repeat") | ("str", "reverse")
+        | ("str", "trim_start") | ("str", "trim_end") | ("str", "pad_left")
+        | ("str", "pad_right") => Some(Str),
+        ("str", "len") | ("str", "index_of") | ("str", "to_int") => Some(Int),
+        ("str", "to_float") => Some(Float),
+        ("str", "contains") | ("str", "starts_with") | ("str", "ends_with") => Some(Bool),
+        ("str", "split") => Some(Value),
+
+        // --- os ---
+        ("os", "platform") | ("os", "arch") | ("os", "cwd") | ("os", "hostname")
+        | ("os", "env_or") => Some(Str),
+        ("os", "getpid") | ("os", "cpu_count") => Some(Int),
+        ("os", "env") => Some(Value), // str | void
+        ("os", "setenv") => Some(Bool),
+        ("os", "exit") => None,
+        ("os", "args") => Some(Value),
+
+        // --- fs ---
+        ("fs", "read") => Some(Value), // str | void
+        ("fs", "write") | ("fs", "exists") | ("fs", "append") | ("fs", "remove")
+        | ("fs", "mkdir") | ("fs", "is_file") | ("fs", "is_dir") | ("fs", "copy")
+        | ("fs", "rename") => Some(Bool),
+        ("fs", "readdir") => Some(Value),
+        ("fs", "size") => Some(Int),
+
+        // --- rand (nondeterministic; format/type-matched) ---
+        ("rand", "int") => Some(Int),
+        ("rand", "float") => Some(Float),
+        ("rand", "bool") => Some(Bool),
+
+        // --- json (encode/pretty are deterministic; decode/parse/get/valid
+        //     remain E0606 — the native value model has no map type yet) ---
+        ("json", "encode") | ("json", "stringify") | ("json", "pretty") => Some(Str),
+
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// If `expr` is a method call on a bridged module alias, resolve it to
+/// `(module, method, args)`. The module name is owned; method/args borrow
+/// from `expr`.
+fn resolve_bridged<'e>(
+    expr: &'e Expression,
+    mods: &ModAliases,
+) -> Option<(String, &'e str, &'e [Expression])> {
+    if let Expression::MethodCall { object, method, args } = expr {
+        if let Expression::Variable(alias) = object.as_ref() {
+            if let Some(module) = mods.get(alias) {
+                if bridged_method_ret(module, method).is_some() {
+                    return Some((module.clone(), method.as_str(), args.as_slice()));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn map_type(t: &TypeExpr, structs: &StructDefs) -> Option<CType> {
     match t {
         TypeExpr::Named(n) => match n.as_str() {
@@ -132,6 +259,7 @@ fn unsupported(file: &str, span_line: usize, span_col: usize, what: &str) -> Dia
 pub fn supported(checked: &CheckedProgram, file: &str) -> Result<(), Diagnostic> {
     let structs = collect_structs(checked);
     let fns = collect_fn_names(checked);
+    let mods = collect_mod_aliases(checked);
     for stmt in &checked.program.statements {
         match &stmt.kind {
             Statement::FnDecl { body, params, return_type, .. } => {
@@ -157,10 +285,28 @@ pub fn supported(checked: &CheckedProgram, file: &str) -> Result<(), Diagnostic>
                         ));
                     }
                 }
-                check_block(body, file, &fns, &structs)?;
+                check_block(body, file, &fns, &structs, &mods)?;
             }
             // Struct declarations are metadata for codegen; allowed at top level.
             Statement::StructDecl { .. } => {}
+            // D4a: imports of the bridged stdlib modules are allowed (they emit
+            // nothing — the C runtime provides the implementations). Imports of
+            // any other module stay a hard E0606 until D4b.
+            Statement::Import { path, .. } => {
+                let module = real_module_name(path);
+                if !is_bridged_module(&module) {
+                    return Err(unsupported(
+                        file,
+                        stmt.span.line,
+                        stmt.span.col,
+                        &format!(
+                            "import of module `{}` (bridged native modules are \
+                             time, log, math, str, os, fs, rand, json)",
+                            module
+                        ),
+                    ));
+                }
+            }
             other => {
                 return Err(unsupported(
                     file,
@@ -235,52 +381,52 @@ fn is_builtin_call(name: &str) -> bool {
     matches!(name, "dec" | "decimal" | "len")
 }
 
-fn check_block(body: &[Stmt], file: &str, fns: &[String], structs: &StructDefs) -> Result<(), Diagnostic> {
+fn check_block(body: &[Stmt], file: &str, fns: &[String], structs: &StructDefs, mods: &ModAliases) -> Result<(), Diagnostic> {
     for stmt in body {
-        check_stmt(stmt, file, fns, structs)?;
+        check_stmt(stmt, file, fns, structs, mods)?;
     }
     Ok(())
 }
 
-fn check_stmt(stmt: &Stmt, file: &str, fns: &[String], structs: &StructDefs) -> Result<(), Diagnostic> {
+fn check_stmt(stmt: &Stmt, file: &str, fns: &[String], structs: &StructDefs, mods: &ModAliases) -> Result<(), Diagnostic> {
     let (l, c) = (stmt.span.line, stmt.span.col);
     match &stmt.kind {
-        Statement::VarDecl { value, .. } => check_expr(value, file, fns, structs, l, c),
+        Statement::VarDecl { value, .. } => check_expr(value, file, fns, structs, mods, l, c),
         Statement::Echo { expr, .. } => {
             if let Expression::StringLiteral(_) = expr {
                 Ok(())
             } else {
-                check_expr(expr, file, fns, structs, l, c)
+                check_expr(expr, file, fns, structs, mods, l, c)
             }
         }
-        Statement::Return(Some(e)) => check_expr(e, file, fns, structs, l, c),
+        Statement::Return(Some(e)) => check_expr(e, file, fns, structs, mods, l, c),
         Statement::Return(None) => Ok(()),
         Statement::Break | Statement::Continue => Ok(()),
         // `match` is supported as a statement (it lowers to an if/else chain).
         Statement::Expr(Expression::Match { subject, arms }) => {
-            check_match(subject, arms, file, fns, structs, l, c)
+            check_match(subject, arms, file, fns, structs, mods, l, c)
         }
-        Statement::Expr(e) => check_expr(e, file, fns, structs, l, c),
+        Statement::Expr(e) => check_expr(e, file, fns, structs, mods, l, c),
         Statement::If { condition, then_body, else_body } => {
-            check_expr(condition, file, fns, structs, l, c)?;
-            check_block(then_body, file, fns, structs)?;
+            check_expr(condition, file, fns, structs, mods, l, c)?;
+            check_block(then_body, file, fns, structs, mods)?;
             if let Some(eb) = else_body {
-                check_block(eb, file, fns, structs)?;
+                check_block(eb, file, fns, structs, mods)?;
             }
             Ok(())
         }
         Statement::While { condition, body } => {
-            check_expr(condition, file, fns, structs, l, c)?;
-            check_block(body, file, fns, structs)
+            check_expr(condition, file, fns, structs, mods, l, c)?;
+            check_block(body, file, fns, structs, mods)
         }
         Statement::For { iterable, body, .. } => match iterable {
             Expression::FnCall { callee, args } => {
                 if let Expression::Variable(name) = callee.as_ref() {
                     if name == "range" && (args.len() == 1 || args.len() == 2) {
                         for a in args {
-                            check_expr(a, file, fns, structs, l, c)?;
+                            check_expr(a, file, fns, structs, mods, l, c)?;
                         }
-                        return check_block(body, file, fns, structs);
+                        return check_block(body, file, fns, structs, mods);
                     }
                 }
                 Err(unsupported(file, l, c, "for-in iterables other than `range(...)`"))
@@ -297,10 +443,11 @@ fn check_match(
     file: &str,
     fns: &[String],
     structs: &StructDefs,
+    mods: &ModAliases,
     l: usize,
     c: usize,
 ) -> Result<(), Diagnostic> {
-    check_expr(subject, file, fns, structs, l, c)?;
+    check_expr(subject, file, fns, structs, mods, l, c)?;
     for arm in arms {
         match &arm.pattern {
             Pattern::Wildcard | Pattern::Variable(_) => {}
@@ -320,7 +467,7 @@ fn check_match(
                 }
             },
         }
-        check_block(&arm.body, file, fns, structs)?;
+        check_block(&arm.body, file, fns, structs, mods)?;
     }
     Ok(())
 }
@@ -330,6 +477,7 @@ fn check_expr(
     file: &str,
     fns: &[String],
     structs: &StructDefs,
+    mods: &ModAliases,
     l: usize,
     c: usize,
 ) -> Result<(), Diagnostic> {
@@ -338,39 +486,28 @@ fn check_expr(
         | Expression::BoolLiteral(_)
         | Expression::FloatLiteral(_)
         | Expression::Variable(_) => Ok(()),
-        Expression::StringLiteral(s) => {
-            if has_interpolation(s) {
-                Err(unsupported(
-                    file,
-                    l,
-                    c,
-                    "string interpolation outside `echo` (only `echo \"... $x\"` is supported)",
-                ))
-            } else {
-                Ok(())
-            }
-        }
+        Expression::StringLiteral(_) => Ok(()),
         Expression::BinaryOp { left, op: _, right } => {
-            check_expr(left, file, fns, structs, l, c)?;
-            check_expr(right, file, fns, structs, l, c)
+            check_expr(left, file, fns, structs, mods, l, c)?;
+            check_expr(right, file, fns, structs, mods, l, c)
         }
         Expression::UnaryOp { op, operand } => match op {
-            UnaryOperator::Neg | UnaryOperator::Not => check_expr(operand, file, fns, structs, l, c),
+            UnaryOperator::Neg | UnaryOperator::Not => check_expr(operand, file, fns, structs, mods, l, c),
             UnaryOperator::Ref | UnaryOperator::Deref | UnaryOperator::MutRef => {
                 Err(unsupported(file, l, c, "reference / dereference operators"))
             }
         },
         Expression::Array(items) => {
             for it in items {
-                check_expr(it, file, fns, structs, l, c)?;
+                check_expr(it, file, fns, structs, mods, l, c)?;
             }
             Ok(())
         }
         Expression::Index { object, index } => {
-            check_expr(object, file, fns, structs, l, c)?;
-            check_expr(index, file, fns, structs, l, c)
+            check_expr(object, file, fns, structs, mods, l, c)?;
+            check_expr(index, file, fns, structs, mods, l, c)
         }
-        Expression::FieldAccess { object, .. } => check_expr(object, file, fns, structs, l, c),
+        Expression::FieldAccess { object, .. } => check_expr(object, file, fns, structs, mods, l, c),
         Expression::StructInit { name, fields } => {
             if !structs.contains_key(name) {
                 return Err(unsupported(
@@ -381,14 +518,14 @@ fn check_expr(
                 ));
             }
             for (_, fexpr) in fields {
-                check_expr(fexpr, file, fns, structs, l, c)?;
+                check_expr(fexpr, file, fns, structs, mods, l, c)?;
             }
             Ok(())
         }
         Expression::FnCall { callee, args } => match callee.as_ref() {
             Expression::Variable(name) if fns.iter().any(|f| f == name) || is_builtin_call(name) => {
                 for a in args {
-                    check_expr(a, file, fns, structs, l, c)?;
+                    check_expr(a, file, fns, structs, mods, l, c)?;
                 }
                 Ok(())
             }
@@ -400,7 +537,31 @@ fn check_expr(
             )),
             _ => Err(unsupported(file, l, c, "indirect / computed calls")),
         },
-        Expression::MethodCall { .. } => Err(unsupported(file, l, c, "method calls")),
+        // D4a: method calls on a bridged stdlib module alias are supported;
+        // arguments are checked recursively. Method calls on anything else, and
+        // module methods outside the bridged set, stay a hard E0606.
+        Expression::MethodCall { object, method, args } => {
+            if let Expression::Variable(alias) = object.as_ref() {
+                if let Some(module) = mods.get(alias) {
+                    if bridged_method_ret(module, method).is_some() {
+                        for a in args {
+                            check_expr(a, file, fns, structs, mods, l, c)?;
+                        }
+                        return Ok(());
+                    }
+                    return Err(unsupported(
+                        file,
+                        l,
+                        c,
+                        &format!(
+                            "module method `{}.{}` (not in the bridged native subset yet)",
+                            module, method
+                        ),
+                    ));
+                }
+            }
+            Err(unsupported(file, l, c, "method calls"))
+        }
         Expression::Pipe { .. } => Err(unsupported(file, l, c, "pipe expressions")),
         Expression::ChanSend { .. } | Expression::ChanRecv { .. } => {
             Err(unsupported(file, l, c, "channels"))
@@ -480,6 +641,7 @@ fn infer_expr(
     scopes: &Scopes,
     sigs: &HashMap<String, FnSig>,
     structs: &StructDefs,
+    mods: &ModAliases,
 ) -> Result<CType, String> {
     match expr {
         Expression::IntLiteral(_) => Ok(CType::Int),
@@ -496,7 +658,7 @@ fn infer_expr(
         Expression::UnaryOp { op, operand } => match op {
             UnaryOperator::Not => Ok(CType::Bool),
             UnaryOperator::Neg => {
-                let t = infer_expr(operand, scopes, sigs, structs).unwrap_or(CType::Int);
+                let t = infer_expr(operand, scopes, sigs, structs, mods).unwrap_or(CType::Int);
                 match t {
                     CType::Float => Ok(CType::Float),
                     CType::Value => Ok(CType::Value),
@@ -510,8 +672,8 @@ fn infer_expr(
             match op {
                 Eq | Neq | Lt | Lte | Gt | Gte | And | Or => Ok(CType::Bool),
                 Add | Sub | Mul | Div | Mod => {
-                    let lt = infer_expr(left, scopes, sigs, structs)?;
-                    let rt = infer_expr(right, scopes, sigs, structs)?;
+                    let lt = infer_expr(left, scopes, sigs, structs, mods)?;
+                    let rt = infer_expr(right, scopes, sigs, structs, mods)?;
                     if lt == CType::Value || rt == CType::Value {
                         Ok(CType::Value)
                     } else if lt == CType::Str || rt == CType::Str {
@@ -540,6 +702,19 @@ fn infer_expr(
                 Err("indirect call".into())
             }
         }
+        // D4a: a bridged stdlib module method's return type.
+        Expression::MethodCall { object, method, .. } => {
+            if let Expression::Variable(alias) = object.as_ref() {
+                if let Some(module) = mods.get(alias) {
+                    if let Some(ret) = bridged_method_ret(module, method) {
+                        return ret.ok_or_else(|| {
+                            format!("module method `{}.{}` returns nothing", module, method)
+                        });
+                    }
+                }
+            }
+            Err("expression not in native subset".into())
+        }
         _ => Err("expression not in native subset".into()),
     }
 }
@@ -558,6 +733,7 @@ fn param_ctype(p: &Param, structs: &StructDefs) -> CType {
 fn resolve_signatures(
     checked: &CheckedProgram,
     structs: &StructDefs,
+    mods: &ModAliases,
 ) -> Result<HashMap<String, FnSig>, Diagnostic> {
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
 
@@ -596,7 +772,7 @@ fn resolve_signatures(
                 for pp in params {
                     scopes.declare(&pp.name, param_ctype(pp, structs));
                 }
-                if let Some(t) = infer_return_type(body, &mut scopes, &sigs, structs) {
+                if let Some(t) = infer_return_type(body, &mut scopes, &sigs, structs, mods) {
                     if let Some(sig) = sigs.get_mut(name) {
                         sig.ret = Some(t);
                         changed = true;
@@ -616,38 +792,39 @@ fn infer_return_type(
     scopes: &mut Scopes,
     sigs: &HashMap<String, FnSig>,
     structs: &StructDefs,
+    mods: &ModAliases,
 ) -> Option<CType> {
     for stmt in body {
         match &stmt.kind {
             Statement::Return(Some(e)) => {
-                if let Ok(t) = infer_expr(e, scopes, sigs, structs) {
+                if let Ok(t) = infer_expr(e, scopes, sigs, structs, mods) {
                     return Some(t);
                 }
             }
             Statement::VarDecl { name, value, .. } => {
-                if let Ok(t) = infer_expr(value, scopes, sigs, structs) {
+                if let Ok(t) = infer_expr(value, scopes, sigs, structs, mods) {
                     scopes.declare(name, t);
                 }
             }
             Statement::If { then_body, else_body, .. } => {
-                if let Some(t) = infer_return_type(then_body, scopes, sigs, structs) {
+                if let Some(t) = infer_return_type(then_body, scopes, sigs, structs, mods) {
                     return Some(t);
                 }
                 if let Some(eb) = else_body {
-                    if let Some(t) = infer_return_type(eb, scopes, sigs, structs) {
+                    if let Some(t) = infer_return_type(eb, scopes, sigs, structs, mods) {
                         return Some(t);
                     }
                 }
             }
             Statement::While { body, .. } => {
-                if let Some(t) = infer_return_type(body, scopes, sigs, structs) {
+                if let Some(t) = infer_return_type(body, scopes, sigs, structs, mods) {
                     return Some(t);
                 }
             }
             Statement::For { variable, body, .. } => {
                 scopes.push();
                 scopes.declare(variable, CType::Int);
-                let t = infer_return_type(body, scopes, sigs, structs);
+                let t = infer_return_type(body, scopes, sigs, structs, mods);
                 scopes.pop();
                 if t.is_some() {
                     return t;
@@ -655,7 +832,7 @@ fn infer_return_type(
             }
             Statement::Expr(Expression::Match { arms, .. }) => {
                 for arm in arms {
-                    if let Some(t) = infer_return_type(&arm.body, scopes, sigs, structs) {
+                    if let Some(t) = infer_return_type(&arm.body, scopes, sigs, structs, mods) {
                         return Some(t);
                     }
                 }
@@ -719,12 +896,19 @@ fn fmt_float_literal(f: f64) -> String {
 
 enum Seg {
     Lit(String),
-    Var(String),
+    /// A ready-to-emit `const char*` C expression for an interpolated value.
+    Expr(String),
 }
 
-/// Compile-time interpolation of a string literal (mirrors the interpreter's
-/// simple-variable substitution). A Value-typed variable is rendered via
-/// `ran_value_to_str`; scalars via their type-specific converter.
+/// Compile-time interpolation of a string literal, matching the interpreter's
+/// `interpolate_string` byte-for-byte: `$name`, `${name}`, dotted field paths
+/// (`$user.name`, `${order.total}`), trailing-dot handling, and the
+/// "unknown name left literal" rule (an unresolved `$path` stays the literal
+/// text `$path`). The produced expression is a `const char*` built by
+/// `ran_concat` of literal and value segments. A simple variable is rendered by
+/// its type-specific converter; a dotted path on a `Value` base is resolved at
+/// runtime by `ran_interp_path` (which also applies the literal fallback when a
+/// field is missing) and manages its own `RanValue` temporaries.
 fn build_interpolated(s: &str, scopes: &Scopes) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut segs: Vec<Seg> = Vec::new();
@@ -755,17 +939,35 @@ fn build_interpolated(s: &str, scopes: &Scopes) -> String {
                     i -= 1;
                 }
             }
-            let resolved = if !path.contains('.') {
-                scopes.lookup(&path).map(|t| (path.clone(), t))
-            } else {
-                None
+            // Resolve base + optional dotted remainder against the scope.
+            let mut split = path.splitn(2, '.');
+            let base = split.next().unwrap_or("");
+            let rest = split.next();
+            let piece: Option<String> = match scopes.lookup(base) {
+                None => None, // base not in scope -> interpreter leaves it literal
+                Some(ty) => match rest {
+                    // Simple `$name` / `${name}`: render via the type converter.
+                    None => Some(to_cstr(&c_ident(base), ty)),
+                    // Dotted path: only a heap `Value` base can carry fields; a
+                    // scalar base resolves to None in the interpreter (left literal).
+                    Some(fields) if ty == CType::Value => {
+                        let fallback = format!("${}", path);
+                        Some(format!(
+                            "ran_interp_path({}, {}, {})",
+                            c_ident(base),
+                            c_string_literal(fields),
+                            c_string_literal(&fallback)
+                        ))
+                    }
+                    Some(_) => None,
+                },
             };
-            match resolved {
-                Some((name, _)) => {
+            match piece {
+                Some(expr) => {
                     if !lit.is_empty() {
                         segs.push(Seg::Lit(std::mem::take(&mut lit)));
                     }
-                    segs.push(Seg::Var(name));
+                    segs.push(Seg::Expr(expr));
                 }
                 None => {
                     lit.push('$');
@@ -787,10 +989,7 @@ fn build_interpolated(s: &str, scopes: &Scopes) -> String {
     for seg in segs {
         let piece = match seg {
             Seg::Lit(text) => c_string_literal(&text),
-            Seg::Var(name) => {
-                let ty = scopes.lookup(&name).unwrap_or(CType::Str);
-                to_cstr(&c_ident(&name), ty)
-            }
+            Seg::Expr(code) => code,
         };
         expr = Some(match expr {
             None => piece,
@@ -804,6 +1003,7 @@ struct Emit<'a> {
     out: String,
     sigs: &'a HashMap<String, FnSig>,
     structs: &'a StructDefs,
+    mods: &'a ModAliases,
     file: &'a str,
     tmp: usize,
     svar: usize,
@@ -815,11 +1015,12 @@ struct Emit<'a> {
 }
 
 impl<'a> Emit<'a> {
-    fn new(sigs: &'a HashMap<String, FnSig>, structs: &'a StructDefs, file: &'a str) -> Self {
+    fn new(sigs: &'a HashMap<String, FnSig>, structs: &'a StructDefs, mods: &'a ModAliases, file: &'a str) -> Self {
         Emit {
             out: String::new(),
             sigs,
             structs,
+            mods,
             file,
             tmp: 0,
             svar: 0,
@@ -846,8 +1047,30 @@ impl<'a> Emit<'a> {
         self.out.push('\n');
     }
     fn infer(&self, e: &Expression) -> Result<CType, Diagnostic> {
-        infer_expr(e, &self.scopes, self.sigs, self.structs)
+        infer_expr(e, &self.scopes, self.sigs, self.structs, self.mods)
             .map_err(|m| codegen_err(self.file, 0, 0, &m))
+    }
+
+    /// Emit the argument vector for a bridged module call: each argument is
+    /// lowered to an owned `RanValue` temporary (scalars boxed), collected into
+    /// a local C array. Returns `(argv_expr, argc)` — `("NULL", 0)` for no args.
+    /// The temporaries are released by the enclosing statement's cleanup; the C
+    /// runtime only borrows them for the duration of the call.
+    fn emit_bridged_argv(
+        &mut self,
+        args: &[Expression],
+        depth: usize,
+    ) -> Result<(String, usize), Diagnostic> {
+        if args.is_empty() {
+            return Ok(("NULL".to_string(), 0));
+        }
+        let mut temps = Vec::with_capacity(args.len());
+        for a in args {
+            temps.push(self.emit_value(a, depth)?);
+        }
+        let arr = self.fresh_s();
+        self.line(depth, &format!("RanValue {}[] = {{ {} }};", arr, temps.join(", ")));
+        Ok((arr, args.len()))
     }
     fn release_range(&mut self, depth: usize, start: usize, end: usize) {
         for k in (start..end).rev() {
@@ -895,7 +1118,13 @@ impl<'a> Emit<'a> {
             Expression::BoolLiteral(b) => {
                 Ok(((if *b { "true" } else { "false" }).to_string(), CType::Bool))
             }
-            Expression::StringLiteral(s) => Ok((c_string_literal(s), CType::Str)),
+            Expression::StringLiteral(s) => {
+                if has_interpolation(s) {
+                    Ok((build_interpolated(s, &self.scopes), CType::Str))
+                } else {
+                    Ok((c_string_literal(s), CType::Str))
+                }
+            }
             Expression::Variable(name) => match self.scopes.lookup(name) {
                 Some(CType::Value) => Err(codegen_err(
                     self.file,
@@ -944,6 +1173,31 @@ impl<'a> Emit<'a> {
                     codegen_err(self.file, l, c, &format!("`{}` returns nothing and cannot be used as a value", name))
                 })?;
                 Ok((format!("{}({})", c_ident(name), parts.join(", ")), ty))
+            }
+            // D4a: scalar-returning bridged module method (e.g. time.now_ms(),
+            // json.encode(x), str.upper(s)). Value-returning methods are routed
+            // through emit_value instead.
+            Expression::MethodCall { .. } => {
+                let (module, method, args) = resolve_bridged(expr, self.mods)
+                    .ok_or_else(|| codegen_err(self.file, l, c, "unsupported method call"))?;
+                match bridged_method_ret(&module, method) {
+                    Some(Some(CType::Value)) => Err(codegen_err(
+                        self.file,
+                        l,
+                        c,
+                        "value-returning module method used in scalar context",
+                    )),
+                    Some(Some(t)) => {
+                        let (argv, argc) = self.emit_bridged_argv(args, depth)?;
+                        Ok((format!("ran_mod_{}_{}({}, {})", module, method, argv, argc), t))
+                    }
+                    _ => Err(codegen_err(
+                        self.file,
+                        l,
+                        c,
+                        "void module method used as a value",
+                    )),
+                }
             }
             _ => Err(codegen_err(self.file, l, c, "expression not in native subset")),
         }
@@ -1197,6 +1451,20 @@ impl<'a> Emit<'a> {
                 self.line(depth, &format!("RanValue {} = {}({});", t, c_ident(&name), parts.join(", ")));
                 Ok(t)
             }
+            // D4a: value-returning bridged module method (math.abs/max/min,
+            // str.split, os.env/args, fs.read/readdir). The C runtime returns an
+            // owned RanValue.
+            Expression::MethodCall { .. } => {
+                let (module, method, args) = resolve_bridged(expr, self.mods)
+                    .ok_or_else(|| codegen_err(self.file, 0, 0, "unsupported method call"))?;
+                let (argv, argc) = self.emit_bridged_argv(args, depth)?;
+                let t = self.fresh_t();
+                self.line(
+                    depth,
+                    &format!("RanValue {} = ran_mod_{}_{}({}, {});", t, module, method, argv, argc),
+                );
+                Ok(t)
+            }
             _ => Err(codegen_err(self.file, 0, 0, "expression not in native subset")),
         }
     }
@@ -1371,6 +1639,34 @@ impl<'a> Emit<'a> {
                 self.emit_match_stmt(subject, arms, depth)
             }
             Statement::Expr(e) => {
+                // D4a: a bridged module method statement (e.g. `log.info(...)`,
+                // `time.sleep(ms)`). Void methods emit a bare call; value/scalar
+                // results are evaluated and discarded.
+                if let Some((module, method, args)) = resolve_bridged(e, self.mods) {
+                    let start = self.tmp;
+                    match bridged_method_ret(&module, method) {
+                        Some(None) => {
+                            let (argv, argc) = self.emit_bridged_argv(args, depth)?;
+                            self.line(
+                                depth,
+                                &format!("ran_mod_{}_{}({}, {});", module, method, argv, argc),
+                            );
+                        }
+                        Some(Some(CType::Value)) => {
+                            let t = self.emit_value(e, depth)?;
+                            self.line(depth, &format!("(void){};", t));
+                        }
+                        Some(Some(_)) => {
+                            let (code, _) = self.emit_scalar(e, depth)?;
+                            self.line(depth, &format!("(void)({});", code));
+                        }
+                        None => {
+                            return Err(codegen_err(self.file, 0, 0, "unsupported method call"))
+                        }
+                    }
+                    self.release_range(depth, start, self.tmp);
+                    return Ok(());
+                }
                 let start = self.tmp;
                 let ty = self.infer(e)?;
                 if ty == CType::Value {
@@ -1607,7 +1903,8 @@ fn decimal_parts(d: &Decimal) -> (String, u32) {
 /// Lower a checked program (already verified by [`supported`]) to C source.
 pub fn lower(checked: &CheckedProgram, file: &str) -> Result<String, Diagnostic> {
     let structs = collect_structs(checked);
-    let sigs = resolve_signatures(checked, &structs)?;
+    let mods = collect_mod_aliases(checked);
+    let sigs = resolve_signatures(checked, &structs, &mods)?;
 
     let mut out = String::new();
     out.push_str("/* Generated by Ran native AOT codegen (Phase D, D2). Do not edit. */\n");
@@ -1643,7 +1940,7 @@ pub fn lower(checked: &CheckedProgram, file: &str) -> Result<String, Diagnostic>
     out.push('\n');
 
     // Definitions.
-    let mut emitter = Emit::new(&sigs, &structs, file);
+    let mut emitter = Emit::new(&sigs, &structs, &mods, file);
     for stmt in &checked.program.statements {
         if let Statement::FnDecl { name, params, body, .. } = &stmt.kind {
             emitter.emit_fn(name, params, body)?;
@@ -1793,14 +2090,101 @@ fn main() {
 
     #[test]
     fn supported_rejects_imports() {
+        // A NON-bridged module import stays a hard E0606 (http is D4b).
         let src = r#"
-import "std::fs" as fs
+import "std::http" as http
 fn main() {
     echo "hi"
 }
 "#;
         let checked = check(src);
-        let err = supported(&checked, "test.ran").expect_err("import must be rejected");
+        let err = supported(&checked, "test.ran").expect_err("non-bridged import must be rejected");
+        assert_eq!(err.code.as_deref(), Some("E0606"));
+    }
+
+    // ---- D4a: stdlib bridge for the common modules. ------------------------
+
+    #[test]
+    fn supported_accepts_bridged_import_and_calls() {
+        let src = r#"
+import "std::time" as time
+import "std::log" as log
+fn main() {
+    let start = time.now_ms()
+    let total = 0
+    log.info("total =", total)
+    let dt = time.now_ms() - start
+    echo dt
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").expect("bridged time/log import + calls are in the subset");
+    }
+
+    #[test]
+    fn lower_bridged_math_str_os_fs_json_calls() {
+        let src = r#"
+import "std::math" as math
+import "std::str" as str
+import "std::os" as os
+import "std::fs" as fs
+import "std::json" as json
+fn main() {
+    let r = math.sqrt(16.0)
+    echo r
+    let u = str.upper("hi")
+    echo u
+    let p = os.platform()
+    echo p
+    let ok = fs.exists("/tmp")
+    echo ok
+    let j = json.encode([1, 2, 3])
+    echo j
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("ran_mod_math_sqrt("), "math.sqrt lowered:\n{c}");
+        assert!(c.contains("ran_mod_str_upper("), "str.upper lowered:\n{c}");
+        assert!(c.contains("ran_mod_os_platform("), "os.platform lowered:\n{c}");
+        assert!(c.contains("ran_mod_fs_exists("), "fs.exists lowered:\n{c}");
+        assert!(c.contains("ran_mod_json_encode("), "json.encode lowered:\n{c}");
+    }
+
+    #[test]
+    fn lower_bridged_time_and_variadic_log() {
+        let src = r#"
+import "std::time" as time
+import "std::log" as log
+fn main() {
+    let start = time.now_ms()
+    log.info("total =", 42)
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        // time.now_ms() is a scalar int call; log.info is a void variadic call
+        // whose args are boxed into a RanValue argv array with count 2.
+        assert!(c.contains("ran_mod_time_now_ms(NULL, 0)"), "time.now_ms lowered:\n{c}");
+        assert!(c.contains("ran_mod_log_info("), "log.info lowered:\n{c}");
+        assert!(c.contains(", 2);"), "variadic log argv count:\n{c}");
+    }
+
+    #[test]
+    fn supported_rejects_non_bridged_module_method() {
+        // A method call on a bridged alias but an unbridged method is E0606.
+        let src = r#"
+import "std::json" as json
+fn main() {
+    let v = json.decode("[]")
+    echo "x"
+}
+"#;
+        let checked = check(src);
+        let err = supported(&checked, "test.ran")
+            .expect_err("json.decode is not bridged in D4a");
         assert_eq!(err.code.as_deref(), Some("E0606"));
     }
 
@@ -1851,5 +2235,102 @@ fn main() {
         let c = lower(&checked, "test.ran").unwrap();
         assert!(c.contains("double r_a"), "float decl:\n{c}");
         assert!(c.contains("ran_float_to_str("), "float echo:\n{c}");
+    }
+
+    // ---- D3: general string interpolation outside `echo`. ------------------
+
+    #[test]
+    fn supported_accepts_interpolation_in_let_and_return() {
+        // Interpolated string literals are now accepted everywhere a string
+        // expression is allowed (was E0606 before D3).
+        let src = r#"
+fn greet(name: str) -> str {
+    return "hi $name"
+}
+fn main() {
+    let x = 5
+    let s = "x = $x, doubled = ${x}"
+    echo s
+    echo greet("ada")
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").expect("interpolation in let/return is in the subset");
+    }
+
+    #[test]
+    fn lower_interpolation_in_let_binding() {
+        let src = r#"
+fn main() {
+    let x = 5
+    let s = "x = $x"
+    echo s
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        // The let binds a heap C string built by concat of the literal + the
+        // int-rendered value, NOT the raw uninterpolated literal.
+        assert!(c.contains("const char* r_s ="), "str local decl:\n{c}");
+        assert!(c.contains("ran_concat("), "interpolation concat:\n{c}");
+        assert!(c.contains("ran_int_to_str(r_x)"), "int converter for $x:\n{c}");
+        assert!(!c.contains("\"x = $x\""), "raw literal must not survive:\n{c}");
+    }
+
+    #[test]
+    fn lower_interpolation_in_return() {
+        let src = r#"
+fn label(n: int) -> str {
+    return "n=$n"
+}
+fn main() {
+    echo label(7)
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("const char* r_label("), "str-returning fn:\n{c}");
+        assert!(c.contains("ran_int_to_str(r_n)"), "interpolated return:\n{c}");
+    }
+
+    #[test]
+    fn lower_dotted_path_interpolation_on_struct_field() {
+        let src = r#"
+struct Account { owner: str, balance: int }
+fn main() {
+    let acc = Account { owner: "ada", balance: 100 }
+    let s = "owner=$acc.owner bal=${acc.balance}"
+    echo s
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        // Dotted paths on a Value base resolve at runtime through ran_interp_path
+        // with the literal "$path" fallback.
+        assert!(c.contains("ran_interp_path(r_acc, \"owner\""), "dotted owner:\n{c}");
+        assert!(c.contains("ran_interp_path(r_acc, \"balance\""), "dotted balance:\n{c}");
+        assert!(c.contains("\"$acc.owner\""), "owner fallback literal:\n{c}");
+        assert!(c.contains("\"$acc.balance\""), "balance fallback literal:\n{c}");
+    }
+
+    #[test]
+    fn lower_unknown_name_left_literal() {
+        // An unresolved `$missing` stays the literal text `$missing` (matches the
+        // interpreter's "unknown name left literal" rule).
+        let src = r#"
+fn main() {
+    let s = "hello $missing world"
+    echo s
+}
+"#;
+        let checked = check(src);
+        supported(&checked, "test.ran").unwrap();
+        let c = lower(&checked, "test.ran").unwrap();
+        assert!(c.contains("hello $missing world"), "unknown name kept literal:\n{c}");
+        // No interpolation machinery is emitted for a fully-literal string.
+        assert!(!c.contains("ran_interp_path"), "no runtime path resolution:\n{c}");
     }
 }

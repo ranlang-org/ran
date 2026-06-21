@@ -6,7 +6,7 @@ produces a compact native binary, it is a plausible fit for embedded and systems
 
 > Status note: the hardware layer is **library-only**. Code for GPIO, MMIO, serial, and
 > syscalls exists in `src/stdlib/hardware.rs`, but `hardware` is **not exposed to Ran**
-> as an importable module. As of v0.2.2, `import "hardware" as hardware` reports
+> as an importable module. As of v0.2.3, `import "hardware" as hardware` reports
 > `module 'hardware' not found` - the Rust code is never reachable from `.ran` code.
 > This chapter documents the intended model and what you can actually build today. See
 > [16 - Roadmap](16-roadmap.md).

@@ -148,6 +148,13 @@ void     ran_object_set(RanValue obj, size_t idx, RanValue val);
 /* Field access by name. Returns an owned (+1) copy; missing field -> void. */
 RanValue ran_field(RanValue obj, const char *name);
 
+/* String-interpolation dotted-path resolution. Walks the dot-separated `fields`
+ * remainder (e.g. "owner", "address.city") starting from `base` (borrowed). On
+ * full resolution returns the display string (heap) of the resolved value; if
+ * any field is missing or `base` is not an object, returns `fallback` (the
+ * literal "$path" text the interpreter leaves in place). Releases intermediates. */
+const char *ran_interp_path(RanValue base, const char *fields, const char *fallback);
+
 /* ---- Generic operations (replicate interpreter `eval_binary_op`). ----- */
 /* These BORROW their operands (never release them) and return an owned value. */
 RanValue ran_add(RanValue a, RanValue b);
@@ -168,5 +175,106 @@ int64_t  ran_len(RanValue v);
 
 /* Display form matching `format!("{}", value)`. Returns a heap C string. */
 const char *ran_value_to_str(RanValue v);
+
+/* ====================================================================== */
+/* D4a stdlib bridge — common modules implemented in C (libc/libm only).   */
+/*                                                                        */
+/* Every bridged function takes an argument vector `argv` of `argc`        */
+/* already-evaluated RanValue arguments (the codegen boxes scalars), and   */
+/* returns the module method's result in its native C type. The functions  */
+/* BORROW `argv` (they never release it; the caller owns the temporaries). */
+/* Deterministic functions match the interpreter byte-for-byte; the few    */
+/* nondeterministic ones (time.*, rand.*, log timestamp, os.getpid/        */
+/* hostname/args) match shape/format/type only — see ran_rt.c for notes.   */
+/* ====================================================================== */
+
+/* time */
+int64_t     ran_mod_time_now(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_time_now_ms(const RanValue *argv, int64_t argc);
+const char *ran_mod_time_now_iso(const RanValue *argv, int64_t argc);
+void        ran_mod_time_sleep(const RanValue *argv, int64_t argc);
+
+/* log (variadic; all void; fatal exits with code 1) */
+void ran_mod_log_debug(const RanValue *argv, int64_t argc);
+void ran_mod_log_info(const RanValue *argv, int64_t argc);
+void ran_mod_log_warn(const RanValue *argv, int64_t argc);
+void ran_mod_log_error(const RanValue *argv, int64_t argc);
+void ran_mod_log_fatal(const RanValue *argv, int64_t argc);
+
+/* math */
+RanValue ran_mod_math_abs(const RanValue *argv, int64_t argc);
+RanValue ran_mod_math_max(const RanValue *argv, int64_t argc);
+RanValue ran_mod_math_min(const RanValue *argv, int64_t argc);
+double   ran_mod_math_sqrt(const RanValue *argv, int64_t argc);
+double   ran_mod_math_pow(const RanValue *argv, int64_t argc);
+int64_t  ran_mod_math_floor(const RanValue *argv, int64_t argc);
+int64_t  ran_mod_math_ceil(const RanValue *argv, int64_t argc);
+int64_t  ran_mod_math_round(const RanValue *argv, int64_t argc);
+double   ran_mod_math_sin(const RanValue *argv, int64_t argc);
+double   ran_mod_math_cos(const RanValue *argv, int64_t argc);
+double   ran_mod_math_tan(const RanValue *argv, int64_t argc);
+double   ran_mod_math_log(const RanValue *argv, int64_t argc);
+double   ran_mod_math_log10(const RanValue *argv, int64_t argc);
+double   ran_mod_math_pi(const RanValue *argv, int64_t argc);
+double   ran_mod_math_e(const RanValue *argv, int64_t argc);
+
+/* str */
+const char *ran_mod_str_from(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_upper(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_lower(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_trim(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_str_len(const RanValue *argv, int64_t argc);
+bool        ran_mod_str_contains(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_replace(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_str_split(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_join(const RanValue *argv, int64_t argc);
+bool        ran_mod_str_starts_with(const RanValue *argv, int64_t argc);
+bool        ran_mod_str_ends_with(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_str_index_of(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_repeat(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_reverse(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_trim_start(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_trim_end(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_pad_left(const RanValue *argv, int64_t argc);
+const char *ran_mod_str_pad_right(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_str_to_int(const RanValue *argv, int64_t argc);
+double      ran_mod_str_to_float(const RanValue *argv, int64_t argc);
+
+/* os */
+const char *ran_mod_os_platform(const RanValue *argv, int64_t argc);
+const char *ran_mod_os_arch(const RanValue *argv, int64_t argc);
+const char *ran_mod_os_cwd(const RanValue *argv, int64_t argc);
+const char *ran_mod_os_hostname(const RanValue *argv, int64_t argc);
+const char *ran_mod_os_env_or(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_os_getpid(const RanValue *argv, int64_t argc);
+int64_t     ran_mod_os_cpu_count(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_os_env(const RanValue *argv, int64_t argc);
+bool        ran_mod_os_setenv(const RanValue *argv, int64_t argc);
+void        ran_mod_os_exit(const RanValue *argv, int64_t argc);
+RanValue    ran_mod_os_args(const RanValue *argv, int64_t argc);
+
+/* fs */
+RanValue ran_mod_fs_read(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_write(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_exists(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_append(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_remove(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_mkdir(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_is_file(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_is_dir(const RanValue *argv, int64_t argc);
+RanValue ran_mod_fs_readdir(const RanValue *argv, int64_t argc);
+int64_t  ran_mod_fs_size(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_copy(const RanValue *argv, int64_t argc);
+bool     ran_mod_fs_rename(const RanValue *argv, int64_t argc);
+
+/* rand (nondeterministic; xorshift64 seeded like the interpreter) */
+int64_t ran_mod_rand_int(const RanValue *argv, int64_t argc);
+double  ran_mod_rand_float(const RanValue *argv, int64_t argc);
+bool    ran_mod_rand_bool(const RanValue *argv, int64_t argc);
+
+/* json (encode/stringify identical; pretty = indented) */
+const char *ran_mod_json_encode(const RanValue *argv, int64_t argc);
+const char *ran_mod_json_stringify(const RanValue *argv, int64_t argc);
+const char *ran_mod_json_pretty(const RanValue *argv, int64_t argc);
 
 #endif /* RAN_RT_H */

@@ -7,6 +7,14 @@
  *
  * See ran_rt.h for the value model and safety contract.
  */
+/* Enable POSIX/BSD APIs (clock_gettime, nanosleep, setenv, getcwd, readdir)
+ * under -std=c11, which otherwise hides them. Must precede every #include. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
 #include "ran_rt.h"
 
 #include <stdio.h>
@@ -632,6 +640,39 @@ RanValue ran_field(RanValue obj, const char *name) {
     return ran_void();
 }
 
+/* String-interpolation dotted-path resolution (mirrors the interpreter's
+ * `lookup_path` + the "unknown name left literal" fallback in
+ * `interpolate_string`). `base` is borrowed (never released here). `fields` is
+ * the dot-separated remainder after the base variable (e.g. "owner",
+ * "address.city"). Each component is walked with `ran_field`, releasing the
+ * intermediate value. If the full path resolves to a non-void value, its
+ * display string (heap) is returned; if any field is missing or a non-object is
+ * encountered, `fallback` — the literal "$path" text — is returned unchanged. */
+const char *ran_interp_path(RanValue base, const char *fields, const char *fallback) {
+    RanValue cur = ran_clone(base);
+    const char *p = fields;
+    while (*p) {
+        const char *start = p;
+        while (*p && *p != '.') p++;
+        size_t len = (size_t)(p - start);
+        char *fname = (char *)ran_xalloc(len + 1);
+        memcpy(fname, start, len);
+        fname[len] = '\0';
+        RanValue next = ran_field(cur, fname);
+        free(fname);
+        ran_release(cur);
+        cur = next;
+        if (*p == '.') p++;
+        if (cur.tag == RAN_VOID) {
+            ran_release(cur);
+            return fallback;
+        }
+    }
+    const char *s = ran_value_to_str(cur);
+    ran_release(cur);
+    return s;
+}
+
 /* ====================================================================== */
 /* Generic operations — replicate the interpreter's eval_binary_op.       */
 /* ====================================================================== */
@@ -858,4 +899,913 @@ const char *ran_value_to_str(RanValue v) {
         }
     }
     return "";
+}
+
+/* ====================================================================== */
+/* D4a stdlib bridge — common modules in C (libc/libm only).              */
+/*                                                                        */
+/* Honesty contract (see ran_rt.h):                                       */
+/*   * Deterministic functions (math.*, str.*, os.platform/arch/cwd,      */
+/*     fs.* success paths, json.encode/pretty) reproduce the interpreter  */
+/*     byte-for-byte.                                                     */
+/*   * Nondeterministic functions (time.now/now_ms/now_iso, rand.*, the   */
+/*     log timestamp, os.getpid/hostname/args) cannot match exact bytes;  */
+/*     they match the FORMAT/shape/type and the same algorithm/seed.      */
+/*                                                                        */
+/* Documented unavoidable divergences:                                    */
+/*   * str.upper/lower/trim* operate on ASCII (libc), whereas the          */
+/*     interpreter uses Unicode-aware Rust casing/whitespace. Identical    */
+/*     for ASCII text (the overwhelming common case).                      */
+/*   * log args are joined with their display form but NOT re-scanned for  */
+/*     `$name` interpolation (the interpreter re-interpolates the rendered */
+/*     value against the live scope, which has no native runtime analog).  */
+/*   * fs error MESSAGES (stderr) use strerror(); the success/return        */
+/*     values are identical to the interpreter.                            */
+/*   * os.args[0] is this binary's path (not the `ran` launcher path).      */
+/* ====================================================================== */
+
+#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+/* ---- Argument-vector accessors (mirror the interpreter's eval_arg_*). - */
+
+static RanValue marg_val(const RanValue *argv, int64_t argc, int64_t i) {
+    if (i >= 0 && i < argc) return argv[i];
+    return ran_void();
+}
+
+/* eval_arg_str: a present string is returned as-is; any other present value
+ * is rendered via Display; an absent argument yields `def`. */
+static const char *marg_str(const RanValue *argv, int64_t argc, int64_t i, const char *def) {
+    if (i < 0 || i >= argc) return def ? def : "";
+    RanValue v = argv[i];
+    if (v.tag == RAN_STR) return v.u.s->data;
+    return ran_value_to_str(v);
+}
+
+/* eval_arg_int: Int as-is; Float truncates; Str parses (else default). */
+static int64_t marg_int(const RanValue *argv, int64_t argc, int64_t i, int64_t def) {
+    if (i < 0 || i >= argc) return def;
+    RanValue v = argv[i];
+    switch (v.tag) {
+        case RAN_INT:   return v.u.i;
+        case RAN_FLOAT: return (int64_t)v.u.f;
+        case RAN_STR: {
+            errno = 0;
+            char *end = NULL;
+            long long n = strtoll(v.u.s->data, &end, 10);
+            if (errno != 0 || end == v.u.s->data || (end && *end != '\0')) return def;
+            return (int64_t)n;
+        }
+        default: return def;
+    }
+}
+
+/* as_f64 over an argument (Int/Float/Dec → double; else 0.0). */
+static double rv_as_f64_pub(RanValue v); /* fwd */
+static double marg_f64(const RanValue *argv, int64_t argc, int64_t i) {
+    return rv_as_f64_pub(marg_val(argv, argc, i));
+}
+
+/* Value::as_f64 / as_i64 equivalents (used by math.*). */
+static double rv_as_f64_pub(RanValue v) {
+    switch (v.tag) {
+        case RAN_INT:   return (double)v.u.i;
+        case RAN_FLOAT: return v.u.f;
+        case RAN_DEC:   return dec_to_f64((Dec){v.u.dec.mant, v.u.dec.scale});
+        default:        return 0.0;
+    }
+}
+static int64_t rv_as_i64_pub(RanValue v) {
+    switch (v.tag) {
+        case RAN_INT:   return v.u.i;
+        case RAN_FLOAT: return (int64_t)v.u.f;
+        case RAN_DEC:   return (int64_t)dec_to_f64((Dec){v.u.dec.mant, v.u.dec.scale});
+        default:        return 0;
+    }
+}
+
+/* ---- UTF-8 helpers (the interpreter counts/iterates Unicode scalars). - */
+
+/* Count Unicode code points in a UTF-8 string (lead bytes only). */
+static size_t utf8_count(const char *s) {
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+
+/* Byte length of the UTF-8 sequence starting at `p` (1..4). */
+static size_t utf8_seq_len(const unsigned char *p) {
+    unsigned char c = *p;
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* Heap-dup a byte range [start,end) as a NUL-terminated C string. */
+static const char *dup_range(const char *start, const char *end) {
+    size_t n = (size_t)(end - start);
+    char *out = (char *)ran_xalloc(n + 1);
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return out;
+}
+static const char *dup_str(const char *s) {
+    if (!s) s = "";
+    return dup_range(s, s + strlen(s));
+}
+
+/* ====================================================================== */
+/* time — wall-clock helpers (nondeterministic; type/format-matched).      */
+/* ====================================================================== */
+
+int64_t ran_mod_time_now(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return (int64_t)time(NULL); /* seconds since the Unix epoch */
+}
+
+int64_t ran_mod_time_now_ms(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Civil-from-days (Howard Hinnant) — identical to the interpreter's
+ * unix_to_iso, so the FORMAT and the date math match exactly (only the
+ * captured instant differs). */
+static const char *unix_to_iso(int64_t secs) {
+    int64_t days = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);
+    int64_t rem = secs - days * 86400;
+    int hh = (int)(rem / 3600), mm = (int)((rem % 3600) / 60), ss = (int)(rem % 60);
+
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp < 10 ? mp + 3 : mp - 9;
+    int64_t year = m <= 2 ? y + 1 : y;
+
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lldT%02d:%02d:%02dZ",
+             (long long)year, (long long)m, (long long)d, hh, mm, ss);
+    return dup_str(buf);
+}
+
+const char *ran_mod_time_now_iso(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return unix_to_iso((int64_t)time(NULL));
+}
+
+void ran_mod_time_sleep(const RanValue *argv, int64_t argc) {
+    int64_t ms = marg_int(argv, argc, 0, 0);
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* ====================================================================== */
+/* log — leveled lines to stderr. Format identical to the interpreter:    */
+/*   "<color><LEVEL:5-left><reset> [<ISO-8601>] <args joined by space>"   */
+/* (the timestamp is the only nondeterministic part).                      */
+/* ====================================================================== */
+
+static void log_at(const char *level, const char *color, const RanValue *argv, int64_t argc) {
+    const char *iso = unix_to_iso((int64_t)time(NULL));
+    /* Join args with a single space using their display form. */
+    SB b; sb_init(&b);
+    for (int64_t i = 0; i < argc; i++) {
+        if (i) sb_push(&b, " ");
+        sb_push(&b, ran_value_to_str(argv[i]));
+    }
+    fprintf(stderr, "%s%-5s\x1b[0m [%s] %s\n", color, level, iso, b.buf);
+}
+
+void ran_mod_log_debug(const RanValue *argv, int64_t argc) { log_at("DEBUG", "\x1b[36m",   argv, argc); }
+void ran_mod_log_info(const RanValue *argv, int64_t argc)  { log_at("INFO",  "\x1b[32m",   argv, argc); }
+void ran_mod_log_warn(const RanValue *argv, int64_t argc)  { log_at("WARN",  "\x1b[33m",   argv, argc); }
+void ran_mod_log_error(const RanValue *argv, int64_t argc) { log_at("ERROR", "\x1b[31m",   argv, argc); }
+void ran_mod_log_fatal(const RanValue *argv, int64_t argc) {
+    log_at("FATAL", "\x1b[31;1m", argv, argc);
+    exit(1);
+}
+
+/* ====================================================================== */
+/* math — <math.h>. abs/max/min preserve int-vs-float like the interpreter.*/
+/* ====================================================================== */
+
+RanValue ran_mod_math_abs(const RanValue *argv, int64_t argc) {
+    RanValue a = marg_val(argv, argc, 0);
+    if (a.tag == RAN_FLOAT) return ran_from_float(fabs(a.u.f));
+    if (a.tag == RAN_INT)   return ran_from_int(a.u.i < 0 ? -a.u.i : a.u.i);
+    return ran_from_int(0);
+}
+RanValue ran_mod_math_max(const RanValue *argv, int64_t argc) {
+    RanValue a = marg_val(argv, argc, 0), b = marg_val(argv, argc, 1);
+    if (a.tag == RAN_FLOAT || b.tag == RAN_FLOAT) {
+        double x = rv_as_f64_pub(a), y = rv_as_f64_pub(b);
+        return ran_from_float(x > y ? x : y);
+    }
+    int64_t x = rv_as_i64_pub(a), y = rv_as_i64_pub(b);
+    return ran_from_int(x > y ? x : y);
+}
+RanValue ran_mod_math_min(const RanValue *argv, int64_t argc) {
+    RanValue a = marg_val(argv, argc, 0), b = marg_val(argv, argc, 1);
+    if (a.tag == RAN_FLOAT || b.tag == RAN_FLOAT) {
+        double x = rv_as_f64_pub(a), y = rv_as_f64_pub(b);
+        return ran_from_float(x < y ? x : y);
+    }
+    int64_t x = rv_as_i64_pub(a), y = rv_as_i64_pub(b);
+    return ran_from_int(x < y ? x : y);
+}
+double ran_mod_math_sqrt(const RanValue *argv, int64_t argc)  { return sqrt(marg_f64(argv, argc, 0)); }
+double ran_mod_math_pow(const RanValue *argv, int64_t argc)   { return pow(marg_f64(argv, argc, 0), marg_f64(argv, argc, 1)); }
+int64_t ran_mod_math_floor(const RanValue *argv, int64_t argc){ return (int64_t)floor(marg_f64(argv, argc, 0)); }
+int64_t ran_mod_math_ceil(const RanValue *argv, int64_t argc) { return (int64_t)ceil(marg_f64(argv, argc, 0)); }
+int64_t ran_mod_math_round(const RanValue *argv, int64_t argc){ return (int64_t)round(marg_f64(argv, argc, 0)); }
+double ran_mod_math_sin(const RanValue *argv, int64_t argc)   { return sin(marg_f64(argv, argc, 0)); }
+double ran_mod_math_cos(const RanValue *argv, int64_t argc)   { return cos(marg_f64(argv, argc, 0)); }
+double ran_mod_math_tan(const RanValue *argv, int64_t argc)   { return tan(marg_f64(argv, argc, 0)); }
+double ran_mod_math_log(const RanValue *argv, int64_t argc)   { return log(marg_f64(argv, argc, 0)); }
+double ran_mod_math_log10(const RanValue *argv, int64_t argc) { return log10(marg_f64(argv, argc, 0)); }
+double ran_mod_math_pi(const RanValue *argv, int64_t argc)    { (void)argv; (void)argc; return 3.14159265358979311600; }
+double ran_mod_math_e(const RanValue *argv, int64_t argc)     { (void)argv; (void)argc; return 2.71828182845904509080; }
+
+/* ====================================================================== */
+/* str — string utilities. ASCII case/whitespace (see header note).        */
+/* ====================================================================== */
+
+const char *ran_mod_str_from(const RanValue *argv, int64_t argc) {
+    /* Display form, matching `format!("{}", v)`; dup so it is owned/stable. */
+    return dup_str(ran_value_to_str(marg_val(argv, argc, 0)));
+}
+
+const char *ran_mod_str_upper(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    size_t n = strlen(s);
+    char *out = (char *)ran_xalloc(n + 1);
+    for (size_t i = 0; i < n; i++) out[i] = (char)toupper((unsigned char)s[i]);
+    out[n] = '\0';
+    return out;
+}
+const char *ran_mod_str_lower(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    size_t n = strlen(s);
+    char *out = (char *)ran_xalloc(n + 1);
+    for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)s[i]);
+    out[n] = '\0';
+    return out;
+}
+
+static bool is_ascii_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+
+const char *ran_mod_str_trim(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *a = s;
+    const char *b = s + strlen(s);
+    while (a < b && is_ascii_ws(*a)) a++;
+    while (b > a && is_ascii_ws(b[-1])) b--;
+    return dup_range(a, b);
+}
+const char *ran_mod_str_trim_start(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *a = s, *b = s + strlen(s);
+    while (a < b && is_ascii_ws(*a)) a++;
+    return dup_range(a, b);
+}
+const char *ran_mod_str_trim_end(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *a = s, *b = s + strlen(s);
+    while (b > a && is_ascii_ws(b[-1])) b--;
+    return dup_range(a, b);
+}
+
+int64_t ran_mod_str_len(const RanValue *argv, int64_t argc) {
+    return (int64_t)utf8_count(marg_str(argv, argc, 0, ""));
+}
+
+bool ran_mod_str_contains(const RanValue *argv, int64_t argc) {
+    const char *hay = marg_str(argv, argc, 0, "");
+    const char *needle = marg_str(argv, argc, 1, "");
+    return strstr(hay, needle) != NULL;
+}
+bool ran_mod_str_starts_with(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *p = marg_str(argv, argc, 1, "");
+    size_t lp = strlen(p);
+    return strncmp(s, p, lp) == 0;
+}
+bool ran_mod_str_ends_with(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *p = marg_str(argv, argc, 1, "");
+    size_t ls = strlen(s), lp = strlen(p);
+    if (lp > ls) return false;
+    return memcmp(s + (ls - lp), p, lp) == 0;
+}
+
+/* Codepoint index of the first byte offset; matches `s[..i].chars().count()`. */
+int64_t ran_mod_str_index_of(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *needle = marg_str(argv, argc, 1, "");
+    if (*needle == '\0') return 0;            /* Rust find("") == Some(0) */
+    const char *hit = strstr(s, needle);
+    if (!hit) return -1;
+    size_t bytes = (size_t)(hit - s);
+    /* count codepoints in s[0..bytes] */
+    int64_t cp = 0;
+    for (size_t i = 0; i < bytes; ) { i += utf8_seq_len((const unsigned char *)s + i); cp++; }
+    return cp;
+}
+
+const char *ran_mod_str_replace(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *from = marg_str(argv, argc, 1, "");
+    const char *to = marg_str(argv, argc, 2, "");
+    SB b; sb_init(&b);
+    size_t lf = strlen(from);
+    if (lf == 0) {
+        /* Rust: "".replace inserts `to` around every char: -a-b- form. */
+        sb_push(&b, to);
+        for (const char *p = s; *p; ) {
+            size_t l = utf8_seq_len((const unsigned char *)p);
+            char *tmp = (char *)ran_xalloc(l + 1);
+            memcpy(tmp, p, l); tmp[l] = '\0';
+            sb_push(&b, tmp); free(tmp);
+            sb_push(&b, to);
+            p += l;
+        }
+        return b.buf;
+    }
+    const char *p = s;
+    while (1) {
+        const char *hit = strstr(p, from);
+        if (!hit) { sb_push(&b, p); break; }
+        char *pre = (char *)ran_xalloc((size_t)(hit - p) + 1);
+        memcpy(pre, p, (size_t)(hit - p)); pre[hit - p] = '\0';
+        sb_push(&b, pre); free(pre);
+        sb_push(&b, to);
+        p = hit + lf;
+    }
+    return b.buf;
+}
+
+RanValue ran_mod_str_split(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    const char *delim = marg_str(argv, argc, 1, " ");
+    RanValue arr = ran_array_new(4);
+    size_t ld = strlen(delim);
+    if (ld == 0) {
+        /* Rust split(""): "" + each char + "" */
+        ran_array_push(arr, ran_from_str(""));
+        for (const char *p = s; *p; ) {
+            size_t l = utf8_seq_len((const unsigned char *)p);
+            const char *piece = dup_range(p, p + l);
+            ran_array_push(arr, ran_from_str(piece));
+            p += l;
+        }
+        ran_array_push(arr, ran_from_str(""));
+        return arr;
+    }
+    const char *p = s;
+    while (1) {
+        const char *hit = strstr(p, delim);
+        if (!hit) {
+            ran_array_push(arr, ran_from_str(dup_str(p)));
+            break;
+        }
+        ran_array_push(arr, ran_from_str(dup_range(p, hit)));
+        p = hit + ld;
+    }
+    return arr;
+}
+
+const char *ran_mod_str_join(const RanValue *argv, int64_t argc) {
+    RanValue arr = marg_val(argv, argc, 0);
+    const char *sep = marg_str(argv, argc, 1, "");
+    SB b; sb_init(&b);
+    if (arr.tag == RAN_ARRAY) {
+        for (size_t i = 0; i < arr.u.a->len; i++) {
+            if (i) sb_push(&b, sep);
+            sb_push(&b, ran_value_to_str(arr.u.a->items[i]));
+        }
+    }
+    return b.buf;
+}
+
+const char *ran_mod_str_repeat(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    int64_t n = marg_int(argv, argc, 1, 0);
+    if (n < 0) n = 0;
+    size_t ls = strlen(s);
+    SB b; sb_init(&b);
+    for (int64_t i = 0; i < n; i++) {
+        if (ls) sb_push(&b, s);
+    }
+    return b.buf;
+}
+
+const char *ran_mod_str_reverse(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    size_t n = strlen(s);
+    char *out = (char *)ran_xalloc(n + 1);
+    size_t oi = n;
+    out[n] = '\0';
+    /* Reverse by codepoint so multibyte sequences stay intact. */
+    for (const char *p = s; *p; ) {
+        size_t l = utf8_seq_len((const unsigned char *)p);
+        oi -= l;
+        memcpy(out + oi, p, l);
+        p += l;
+    }
+    return out;
+}
+
+/* Take the first codepoint of `pad` (default ' '), as a small heap string. */
+static const char *first_codepoint(const char *pad) {
+    if (!pad || !*pad) return " ";
+    size_t l = utf8_seq_len((const unsigned char *)pad);
+    return dup_range(pad, pad + l);
+}
+
+const char *ran_mod_str_pad_left(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    int64_t width = marg_int(argv, argc, 1, 0);
+    if (width < 0) width = 0;
+    const char *padc = first_codepoint(marg_str(argv, argc, 2, " "));
+    size_t len = utf8_count(s);
+    if ((int64_t)len >= width) return dup_str(s);
+    SB b; sb_init(&b);
+    for (int64_t i = 0; i < width - (int64_t)len; i++) sb_push(&b, padc);
+    sb_push(&b, s);
+    return b.buf;
+}
+const char *ran_mod_str_pad_right(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    int64_t width = marg_int(argv, argc, 1, 0);
+    if (width < 0) width = 0;
+    const char *padc = first_codepoint(marg_str(argv, argc, 2, " "));
+    size_t len = utf8_count(s);
+    if ((int64_t)len >= width) return dup_str(s);
+    SB b; sb_init(&b);
+    sb_push(&b, s);
+    for (int64_t i = 0; i < width - (int64_t)len; i++) sb_push(&b, padc);
+    return b.buf;
+}
+
+int64_t ran_mod_str_to_int(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    /* trim, then parse i64; on failure -> 0 (matches `.parse().unwrap_or(0)`). */
+    while (is_ascii_ws(*s)) s++;
+    const char *end = s + strlen(s);
+    while (end > s && is_ascii_ws(end[-1])) end--;
+    char buf[32];
+    size_t n = (size_t)(end - s);
+    if (n == 0 || n >= sizeof(buf)) return 0;
+    memcpy(buf, s, n); buf[n] = '\0';
+    errno = 0;
+    char *pe = NULL;
+    long long v = strtoll(buf, &pe, 10);
+    if (errno != 0 || pe == buf || *pe != '\0') return 0;
+    return (int64_t)v;
+}
+double ran_mod_str_to_float(const RanValue *argv, int64_t argc) {
+    const char *s = marg_str(argv, argc, 0, "");
+    while (is_ascii_ws(*s)) s++;
+    const char *end = s + strlen(s);
+    while (end > s && is_ascii_ws(end[-1])) end--;
+    char buf[64];
+    size_t n = (size_t)(end - s);
+    if (n == 0 || n >= sizeof(buf)) return 0.0;
+    memcpy(buf, s, n); buf[n] = '\0';
+    errno = 0;
+    char *pe = NULL;
+    double v = strtod(buf, &pe);
+    if (pe == buf || *pe != '\0') return 0.0;
+    return v;
+}
+
+/* ====================================================================== */
+/* os — platform/arch are compile-time constants matching Rust's            */
+/* std::env::consts; the rest use libc/POSIX.                               */
+/* ====================================================================== */
+
+const char *ran_mod_os_platform(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+#if defined(__linux__)
+    return "linux";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(_WIN32)
+    return "windows";
+#elif defined(__FreeBSD__)
+    return "freebsd";
+#else
+    return "unknown";
+#endif
+}
+
+const char *ran_mod_os_arch(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#elif defined(__arm__)
+    return "arm";
+#elif defined(__i386__)
+    return "x86";
+#else
+    return "unknown";
+#endif
+}
+
+const char *ran_mod_os_cwd(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    char buf[4096];
+    if (getcwd(buf, sizeof(buf))) return dup_str(buf);
+    return "";
+}
+
+const char *ran_mod_os_hostname(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    /* Mirror the interpreter: read /etc/hostname (trimmed) if readable, else
+     * $HOSTNAME, else "localhost". */
+    FILE *f = fopen("/etc/hostname", "rb");
+    if (f) {
+        SB b; sb_init(&b);
+        char chunk[256];
+        size_t r;
+        while ((r = fread(chunk, 1, sizeof(chunk) - 1, f)) > 0) { chunk[r] = '\0'; sb_push(&b, chunk); }
+        fclose(f);
+        /* trim trailing/leading ASCII whitespace */
+        char *a = b.buf;
+        char *e = b.buf + strlen(b.buf);
+        while (a < e && is_ascii_ws(*a)) a++;
+        while (e > a && is_ascii_ws(e[-1])) e--;
+        return dup_range(a, e);
+    }
+    const char *h = getenv("HOSTNAME");
+    if (h) return dup_str(h);
+    return "localhost";
+}
+
+const char *ran_mod_os_env_or(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *def = marg_str(argv, argc, 1, "");
+    const char *v = getenv(key);
+    return v ? dup_str(v) : dup_str(def);
+}
+
+int64_t ran_mod_os_getpid(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return (int64_t)getpid();
+}
+
+int64_t ran_mod_os_cpu_count(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int64_t)n : 1;
+}
+
+/* os.env(key): Str if set, else Void (matches the interpreter). */
+RanValue ran_mod_os_env(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *v = getenv(key);
+    return v ? ran_from_str(v) : ran_void();
+}
+
+bool ran_mod_os_setenv(const RanValue *argv, int64_t argc) {
+    const char *key = marg_str(argv, argc, 0, "");
+    const char *val = marg_str(argv, argc, 1, "");
+    setenv(key, val, 1);
+    return true;
+}
+
+void ran_mod_os_exit(const RanValue *argv, int64_t argc) {
+    exit((int)marg_int(argv, argc, 0, 0));
+}
+
+/* os.args via /proc/self/cmdline (Linux). argv[0] is THIS binary's path, so
+ * it differs from the interpreter's launcher path — type/shape-matched only. */
+RanValue ran_mod_os_args(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    RanValue arr = ran_array_new(4);
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return arr;
+    SB b; sb_init(&b);
+    int ch;
+    while ((ch = fgetc(f)) != EOF) {
+        if (ch == '\0') {
+            ran_array_push(arr, ran_from_str(b.buf));
+            b.len = 0; b.buf[0] = '\0';
+        } else {
+            char one[2] = { (char)ch, '\0' };
+            sb_push(&b, one);
+        }
+    }
+    if (b.len > 0) ran_array_push(arr, ran_from_str(b.buf));
+    fclose(f);
+    return arr;
+}
+
+/* ====================================================================== */
+/* fs — file system over stdio/POSIX. Return values match the interpreter; */
+/* error MESSAGES use strerror (see header note).                          */
+/* ====================================================================== */
+
+RanValue ran_mod_fs_read(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ran: fs.read error: %s\n", strerror(errno)); return ran_void(); }
+    SB b; sb_init(&b);
+    char chunk[4096];
+    size_t r;
+    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        /* Preserve embedded NULs poorly (text-oriented), but typical text is
+         * fine; matches the interpreter's read_to_string for text files. */
+        char *tmp = (char *)ran_xalloc(r + 1);
+        memcpy(tmp, chunk, r); tmp[r] = '\0';
+        sb_push(&b, tmp); free(tmp);
+    }
+    fclose(f);
+    return ran_from_str(b.buf);
+}
+
+bool ran_mod_fs_write(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    const char *content = marg_str(argv, argc, 1, "");
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "ran: fs.write error: %s\n", strerror(errno)); return false; }
+    size_t n = strlen(content);
+    bool ok = fwrite(content, 1, n, f) == n;
+    fclose(f);
+    if (!ok) fprintf(stderr, "ran: fs.write error: %s\n", strerror(errno));
+    return ok;
+}
+
+bool ran_mod_fs_exists(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+bool ran_mod_fs_append(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    const char *content = marg_str(argv, argc, 1, "");
+    FILE *f = fopen(path, "ab");
+    if (!f) return false;
+    size_t n = strlen(content);
+    bool ok = fwrite(content, 1, n, f) == n;
+    fclose(f);
+    return ok;
+}
+
+bool ran_mod_fs_remove(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    return remove(path) == 0;
+}
+
+/* Recursive mkdir (like std::fs::create_dir_all). */
+static bool mkdir_p(const char *path) {
+    if (!path || !*path) return false;
+    size_t len = strlen(path);
+    char *tmp = (char *)ran_xalloc(len + 1);
+    memcpy(tmp, path, len + 1);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0777) != 0 && errno != EEXIST) { free(tmp); return false; }
+            *p = '/';
+        }
+    }
+    bool ok = (mkdir(tmp, 0777) == 0 || errno == EEXIST);
+    free(tmp);
+    return ok;
+}
+bool ran_mod_fs_mkdir(const RanValue *argv, int64_t argc) {
+    return mkdir_p(marg_str(argv, argc, 0, ""));
+}
+
+bool ran_mod_fs_is_file(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+bool ran_mod_fs_is_dir(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+RanValue ran_mod_fs_readdir(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, ".");
+    RanValue arr = ran_array_new(8);
+    DIR *d = opendir(path);
+    if (!d) return arr;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        ran_array_push(arr, ran_from_str(e->d_name));
+    }
+    closedir(d);
+    return arr;
+}
+
+int64_t ran_mod_fs_size(const RanValue *argv, int64_t argc) {
+    const char *path = marg_str(argv, argc, 0, "");
+    struct stat st;
+    if (stat(path, &st) == 0) return (int64_t)st.st_size;
+    return -1;
+}
+
+bool ran_mod_fs_copy(const RanValue *argv, int64_t argc) {
+    const char *from = marg_str(argv, argc, 0, "");
+    const char *to = marg_str(argv, argc, 1, "");
+    FILE *in = fopen(from, "rb");
+    if (!in) return false;
+    FILE *out = fopen(to, "wb");
+    if (!out) { fclose(in); return false; }
+    char chunk[8192];
+    size_t r;
+    bool ok = true;
+    while ((r = fread(chunk, 1, sizeof(chunk), in)) > 0) {
+        if (fwrite(chunk, 1, r, out) != r) { ok = false; break; }
+    }
+    fclose(in);
+    fclose(out);
+    return ok;
+}
+
+bool ran_mod_fs_rename(const RanValue *argv, int64_t argc) {
+    const char *from = marg_str(argv, argc, 0, "");
+    const char *to = marg_str(argv, argc, 1, "");
+    return rename(from, to) == 0;
+}
+
+/* ====================================================================== */
+/* rand — xorshift64, lazily seeded from the wall clock like the           */
+/* interpreter (nondeterministic; only the value distribution is matched). */
+/* ====================================================================== */
+
+static uint64_t g_rand_state = 0;
+
+static uint64_t rand_u64(void) {
+    uint64_t x = g_rand_state;
+    if (x == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        x = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) | 1ull;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    g_rand_state = x;
+    return x;
+}
+
+int64_t ran_mod_rand_int(const RanValue *argv, int64_t argc) {
+    int64_t lo = marg_int(argv, argc, 0, 0);
+    int64_t hi = marg_int(argv, argc, 1, INT64_MAX);
+    int64_t range = hi - lo;
+    if (range < 1) range = 1;
+    return lo + (int64_t)(rand_u64() % (uint64_t)range);
+}
+double ran_mod_rand_float(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return (double)rand_u64() / (double)UINT64_MAX;
+}
+bool ran_mod_rand_bool(const RanValue *argv, int64_t argc) {
+    (void)argv; (void)argc;
+    return (rand_u64() % 2) == 0;
+}
+
+/* ====================================================================== */
+/* json — encode/stringify (compact) and pretty (2-space indent).         */
+/* Matches the interpreter's to_json / to_json_pretty byte-for-byte for    */
+/* the native value model (arrays of scalars are fully deterministic;      */
+/* object FIELD ORDER follows declaration order here).                     */
+/* ====================================================================== */
+
+/* RFC 8259 string escaping into an SB (mirrors json_escape_str). */
+static void json_escape_into(SB *b, const char *s) {
+    sb_push(b, "\"");
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned char c = *p;
+        switch (c) {
+            case '"':  sb_push(b, "\\\""); break;
+            case '\\': sb_push(b, "\\\\"); break;
+            case '\n': sb_push(b, "\\n"); break;
+            case '\r': sb_push(b, "\\r"); break;
+            case '\t': sb_push(b, "\\t"); break;
+            case '\b': sb_push(b, "\\b"); break;
+            case '\f': sb_push(b, "\\f"); break;
+            default:
+                if (c < 0x20) {
+                    char u[8];
+                    snprintf(u, sizeof(u), "\\u%04x", (unsigned)c);
+                    sb_push(b, u);
+                } else {
+                    char one[2] = { (char)c, '\0' };
+                    sb_push(b, one);
+                }
+        }
+    }
+    sb_push(b, "\"");
+}
+
+static void json_encode_into(SB *b, RanValue v) {
+    switch (v.tag) {
+        case RAN_VOID:  sb_push(b, "null"); break;
+        case RAN_INT:   sb_push(b, ran_int_to_str(v.u.i)); break;
+        case RAN_FLOAT: sb_push(b, ran_float_to_str(v.u.f)); break;
+        case RAN_DEC:   sb_push(b, dec_to_str((Dec){v.u.dec.mant, v.u.dec.scale})); break;
+        case RAN_BOOL:  sb_push(b, v.u.b ? "true" : "false"); break;
+        case RAN_STR:   json_escape_into(b, v.u.s->data); break;
+        case RAN_ARRAY: {
+            sb_push(b, "[");
+            for (size_t i = 0; i < v.u.a->len; i++) {
+                if (i) sb_push(b, ",");
+                json_encode_into(b, v.u.a->items[i]);
+            }
+            sb_push(b, "]");
+            break;
+        }
+        case RAN_OBJECT: {
+            sb_push(b, "{");
+            for (size_t i = 0; i < v.u.o->n; i++) {
+                if (i) sb_push(b, ",");
+                json_escape_into(b, v.u.o->names[i]);
+                sb_push(b, ":");
+                json_encode_into(b, v.u.o->vals[i]);
+            }
+            sb_push(b, "}");
+            break;
+        }
+    }
+}
+
+const char *ran_mod_json_encode(const RanValue *argv, int64_t argc) {
+    SB b; sb_init(&b);
+    json_encode_into(&b, marg_val(argv, argc, 0));
+    return b.buf;
+}
+const char *ran_mod_json_stringify(const RanValue *argv, int64_t argc) {
+    return ran_mod_json_encode(argv, argc);
+}
+
+static void sb_indent(SB *b, int n) { for (int i = 0; i < n; i++) sb_push(b, "  "); }
+
+/* Mirrors to_json_pretty: arrays/objects expand with 2-space indentation;
+ * scalars fall back to compact json. */
+static void json_pretty_into(SB *b, RanValue v, int indent) {
+    if (v.tag == RAN_ARRAY) {
+        if (v.u.a->len == 0) { sb_push(b, "[]"); return; }
+        sb_push(b, "[\n");
+        for (size_t i = 0; i < v.u.a->len; i++) {
+            if (i) sb_push(b, ",\n");
+            sb_indent(b, indent + 1);
+            json_pretty_into(b, v.u.a->items[i], indent + 1);
+        }
+        sb_push(b, "\n");
+        sb_indent(b, indent);
+        sb_push(b, "]");
+        return;
+    }
+    if (v.tag == RAN_OBJECT) {
+        if (v.u.o->n == 0) { sb_push(b, "{}"); return; }
+        sb_push(b, "{\n");
+        for (size_t i = 0; i < v.u.o->n; i++) {
+            if (i) sb_push(b, ",\n");
+            sb_indent(b, indent + 1);
+            json_escape_into(b, v.u.o->names[i]);
+            sb_push(b, ": ");
+            json_pretty_into(b, v.u.o->vals[i], indent + 1);
+        }
+        sb_push(b, "\n");
+        sb_indent(b, indent);
+        sb_push(b, "}");
+        return;
+    }
+    json_encode_into(b, v);
+}
+
+const char *ran_mod_json_pretty(const RanValue *argv, int64_t argc) {
+    SB b; sb_init(&b);
+    json_pretty_into(&b, marg_val(argv, argc, 0), 0);
+    return b.buf;
 }

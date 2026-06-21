@@ -17,6 +17,49 @@ making native the default once the subset matures, and Phases E–G (compiler
 stdlib, the Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that
 defines 1.0.0).
 
+## [Unreleased]
+
+Next: native AOT D4b — a native map/dict value type (unlocking `json.decode`/`parse`,
+`os.meminfo`) and the heavier stdlib modules (`http`, `db`, `web`, `concurrency`,
+`crypto`, `env`); then closures/trait dispatch native, `--link-static`, and making
+native the default once the subset matures. Phases E–G (compiler stdlib, the
+Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0) follow.
+
+## [0.2.3] — Native string interpolation + stdlib bridge (D3/D4a)
+
+Backward-compatible. The native AOT path (`ran build --native`) gained general
+string interpolation and a standard-library bridge, so real programs — with
+`import`s and module calls — now compile to native machine code. Verified: 391
+tests green; the default `ran build` is unchanged.
+
+### Added — native string interpolation (D3)
+
+- Interpolated string literals (`"x = $x"`, `"${order.total}"`, dotted paths like
+  `"$acc.owner"`) now work **anywhere** in native code (let bindings, returns,
+  arguments, concatenation), not just inside `echo` — byte-for-byte identical to
+  the interpreter, including the "unknown `$name` left literal" rule.
+
+### Added — native stdlib bridge (D4a)
+
+- `import "std::<m>" as <m>` and module method calls now compile to native for the
+  common modules, implemented in the C runtime (`libran_rt`, libc/libm only — the
+  Rust runtime is not linked): **`time`, `log`, `math`, `str`, `os`, `fs`, `rand`,
+  `json`** (encode/stringify/pretty). Variadic `log.*` matches the interpreter's
+  line format.
+- Deterministic functions (`math.*`, `str.*`, `os.platform/arch`, `fs.*`,
+  `json.encode/stringify/pretty`) are byte-for-byte identical to the interpreter;
+  nondeterministic ones (`time.*`, `rand.*`, `log` timestamps, `os.getpid/hostname`)
+  match format/shape/type (documented divergences in `ran_rt.c`).
+- A real program (e.g. a big integer-sum loop with `time.now_ms()` deltas and
+  `log.info(...)`) now builds with `ran build --native` and runs the hot loop as
+  native `int64` code.
+
+### Still a hard `E0606` (deferred to D4b)
+
+- Modules: `http`, `db`, `web`, `concurrency`, `crypto`, `env`, `html`, and the
+  `decimal` module-form. Within bridged modules: `json.decode/parse/get/valid`,
+  `os.meminfo` (need the native map type). Never a silent fallback.
+
 ## [0.2.2] — Memory-safe runtime, VM engine & native AOT codegen
 
 A large, **backward-compatible** release. The runtime is substantially
