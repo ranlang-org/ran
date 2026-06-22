@@ -43,6 +43,41 @@ long-running server must not leak per request.) Phases E–G (compiler stdlib,
 the Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0)
 follow.
 
+## [Unreleased]
+
+Next: native HTTP client (TLS) + HTTP server (after fixing the native string-refcount
+leak), then `concurrency` (pthreads) and a completed-then-bridged `crypto`;
+`--link-static`; making native the default. On the self-hosting track: grow the
+Ran-written compiler (`bootstrap/checker.ran` → `codegen.ran` → the `ranc` CLI) toward
+the Stage A→D bootstrap fixed point that defines 1.0.0. A language fix is also queued:
+short-circuit `&&`/`||` (currently both sides evaluate, a footgun the Ran compiler
+sources must work around).
+
+## [0.3.1] — Self-hosting begins: a Ran parser written in Ran
+
+Milestone release: **part of the Ran compiler is now written in Ran.** Alongside the
+existing Ran-written lexer, a recursive-descent **parser written in Ran**
+(`bootstrap/parser.ran`) turns tokens into an AST and runs today on the `ran` binary
+(interpreter, VM, and under `--ownership=strict`). This is the headline step toward
+self-hosting (the Rust implementation compiling Ran → Ran compiling Ran). Backward
+compatible; verified 395 tests green plus the bootstrap components running clean.
+
+### Added — `bootstrap/parser.ran` (the parser, in Ran)
+
+- Pure Ran (no `std::` imports), self-contained (bundles its own `lex`), one `main`.
+- Recursive-descent parser for a real subset: function declarations, `let`/`let mut`,
+  `return`, `if`/`else`, `while`, `echo`, assignment, expression statements; full
+  expression **precedence** (`||`, `&&`, comparisons, `+ -`, `* / %`, unary `- !`),
+  calls, and parenthesized expressions. AST nodes are tagged maps; parse errors become
+  located `Error` nodes (no host crash). Runs identically on the VM and the interpreter
+  and passes `--ownership=strict`.
+
+### Fixed
+
+- `bootstrap/lexer.ran` could crash at end-of-input (`E1012`) because Ran's `&&` is not
+  short-circuit; its scan loops are now EOF-safe (using `break`). Both Ran compiler
+  components run clean on the current binary.
+
 ## [0.2.5] — Native SQLite (`db`) (D4b-3a)
 
 Backward-compatible. The native AOT path can now build database programs:

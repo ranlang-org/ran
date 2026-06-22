@@ -12,8 +12,8 @@ incrementally toward self-hosting. It runs on the current `ran` interpreter
 | File | Phase | Status |
 |------|-------|--------|
 | `lexer.ran` | B1 — source → tokens | ✅ runs on the interpreter; passes `--ownership=strict` |
-| `parser.ran` | B2 — tokens → AST | ⬜ next |
-| `checker.ran` | B3 — analysis + ownership | ⬜ |
+| `parser.ran` | B2 — tokens → AST | ✅ runs on the interpreter & VM; passes `--ownership=strict` |
+| `checker.ran` | B3 — analysis + ownership | ⬜ next |
 | `codegen.ran` | B4 — AST → bytecode/native | ⬜ |
 
 Run the lexer proof-of-concept:
@@ -22,6 +22,29 @@ Run the lexer proof-of-concept:
 ran bootstrap/lexer.ran
 # tokenizes `fn add(a, b) { return a + b }` and a second expression
 ```
+
+Run the parser proof-of-concept:
+
+```fish
+ran bootstrap/parser.ran
+# lexes + parses several sample programs and prints an indented,
+# S-expression-ish AST dump plus a node count for each. Output is identical
+# on the VM (default), the interpreter (`--interp`), and under
+# `--ownership=strict`.
+```
+
+`parser.ran` is a recursive-descent parser for a subset of Ran (function
+declarations; `let`/`return`/`if`/`else`/`while`/`echo`/assignment/expression
+statements; and the full expression precedence ladder `|| && == != < <= > >=
++ - * / %` with unary `- !`, calls, and parenthesized groups). It produces an
+AST of tagged maps and reports syntax errors as `Error` nodes (carrying an
+`E####` code, message, and the offending token) instead of crashing the host.
+
+> The lexer is **duplicated** inside `parser.ran` on purpose: each bootstrap
+> file has exactly one `fn main()`, so `import "./lexer"` would merge two
+> `main`s (an `E0008` duplicate definition). Wiring the stages together as real
+> modules is task 15.4 (`ranc.ran`); until then each file stays self-contained
+> and runnable on its own.
 
 It is written in **pure Ran** (no `std::` imports) using only core features:
 `.chars()`, array indexing, `push`, and lexicographic character comparison.

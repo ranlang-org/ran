@@ -105,7 +105,7 @@ It is not a general-purpose public product.
 
 ## Honest limitations (today)
 
-Ran is young (v0.2.5). Not yet available:
+Ran is young (v0.3.1). Not yet available:
 
 - closures / lambdas (`fn(x) { ... }` as a value) — planned
 - real ownership enforcement (syntax parses but is cosmetic)

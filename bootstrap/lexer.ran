@@ -70,7 +70,10 @@ fn lex(src) {
                 if chars[i + 1] == "/" { slashslash = true }
             }
             if chars[i] == "#" || slashslash {
-                while i < n && chars[i] != "\n" { i = i + 1 }
+                while i < n {
+                    if chars[i] == "\n" { break }
+                    i = i + 1
+                }
                 handled = true
             }
 
@@ -78,7 +81,8 @@ fn lex(src) {
             if !handled && chars[i] == "\"" {
                 let mut s = ""
                 i = i + 1
-                while i < n && chars[i] != "\"" {
+                while i < n {
+                    if chars[i] == "\"" { break }
                     s = s + chars[i]
                     i = i + 1
                 }
@@ -90,7 +94,8 @@ fn lex(src) {
             # number
             if !handled && is_digit(&chars[i]) {
                 let mut num = ""
-                while i < n && is_digit(&chars[i]) {
+                while i < n {
+                    if !is_digit(&chars[i]) { break }
                     num = num + chars[i]
                     i = i + 1
                 }
@@ -101,7 +106,8 @@ fn lex(src) {
             # identifier or keyword
             if !handled && is_alpha(&chars[i]) {
                 let mut word = ""
-                while i < n && is_alnum(&chars[i]) {
+                while i < n {
+                    if !is_alnum(&chars[i]) { break }
                     word = word + chars[i]
                     i = i + 1
                 }

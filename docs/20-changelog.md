@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1 — Self-hosting begins: a Ran parser written in Ran
+
+Milestone: **part of the Ran compiler is now written in Ran.** Alongside the existing
+Ran-written lexer, a recursive-descent **parser written in Ran**
+(`bootstrap/parser.ran`) turns tokens into an AST and runs today on the `ran` binary
+(VM, interpreter, and `--ownership=strict`). Headline step toward self-hosting.
+Backward compatible. Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **`bootstrap/parser.ran`:** pure Ran, self-contained, one `main`. Recursive-descent
+  parser for a real subset (fn decls, `let`/`let mut`, `return`, `if`/`else`, `while`,
+  `echo`, assignment, expr statements) with full expression precedence, calls, and
+  parentheses. AST nodes are tagged maps; parse errors are located `Error` nodes (no
+  crash). Runs on VM + interpreter identically; passes `--ownership=strict`.
+- **Fixed `bootstrap/lexer.ran`:** EOF-safe scan loops (Ran's `&&` is not short-circuit,
+  which could trip `E1012` at end of input). Both compiler-in-Ran components now run
+  clean on the current binary.
+
 ## 0.2.5 — Native SQLite (`db`) (D4b-3a)
 
 Backward-compatible. `ran build --native` now bridges the `db` (embedded SQLite)

@@ -109,9 +109,11 @@ Interpreter wins already landed (Stage 1):
 
 ## Phase 5 — Write the Ran compiler in Ran
 
-- [~] `bootstrap/lexer.ran` — source → tokens. **Working** on the interpreter
-      today; passes `--ownership=strict`; pure Ran (no stdlib). (Phase B1)
-- [ ] `parser.ran` — tokens → AST
+- [x] `bootstrap/lexer.ran` — source → tokens. **Working** on the interpreter, the
+      VM, and under `--ownership=strict`; pure Ran (no stdlib). EOF-safe loops.
+- [x] `parser.ran` — tokens → AST. **Working** (`bootstrap/parser.ran`, v0.3.1):
+      recursive-descent over a real subset with full expression precedence; AST as
+      tagged maps; located error nodes; runs on VM + interpreter + `--ownership=strict`.
 - [ ] `checker.ran` — analyzer + ownership (mirrors the spec from Phase 3)
 - [ ] `codegen.ran` — AST → the Phase-2 target (bytecode first, then native)
 - [ ] CLI in Ran wiring the above (`ranc`)

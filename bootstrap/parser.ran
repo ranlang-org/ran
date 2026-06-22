@@ -1,0 +1,984 @@
+#!/usr/bin/env ran
+# bootstrap/parser.ran — a recursive-descent parser for a subset of Ran,
+# WRITTEN IN RAN.
+#
+# Second component of the self-hosted compiler (Phase B2 of the bootstrap
+# roadmap, after `lexer.ran`). It runs on the current `ran` interpreter/VM
+# today: Ran can already turn a Ran token stream into an AST. Like the lexer it
+# uses only core language features (no `std::` import): `map()`/`set`/`get`,
+# arrays, `push`, `len`, `.chars()`, `if`/`while`, and recursion. It also passes
+# `--ownership=strict` (every reused value is borrowed with `&`, like the lexer).
+#
+# IMPORTANT — the lexer is duplicated below ON PURPOSE. Each bootstrap file has
+# exactly one `fn main()`, and `import "./lexer"` would merge two `main`s into
+# one program (an E0008 duplicate-definition error). Wiring lexer + parser into
+# a single `ranc` CLI as proper modules is a later task (15.4); until then this
+# file is self-contained so `ran bootstrap/parser.ran` just works.
+#
+# NOTE on `&&`/`||`: in the current language they are NOT short-circuit (both
+# sides always evaluate, see docs/25-language-spec.md §2). With checked indexing
+# (E1012) that means `while i < n && f(arr[i])` would read `arr[n]` out of
+# bounds. So every scan loop here guards the bounds with a nested `if` instead,
+# and the token cursor is read through an EOF-safe `at()` that returns an `eof`
+# sentinel past the end.
+#
+# NOTE on borrowing: passing a bare variable by value moves it (E0210 under
+# strict), even a scalar `int`. So every argument that is a plain variable is
+# borrowed with `&` (the callee reads/clones it); only fresh temporaries like
+# `pos + 1` are passed by value.
+#
+# Output: an indented, S-expression-ish AST dump for each sample program, plus a
+# node count — a deterministic golden you can eyeball.
+
+# ===========================================================================
+# SECTION 1 — Lexer (adapted copy of bootstrap/lexer.ran; EOF-safe scan loops)
+# ===========================================================================
+
+fn is_digit(c) {
+    if c >= "0" { if c <= "9" { return true } }
+    return false
+}
+
+fn is_alpha(c) {
+    if c >= "a" { if c <= "z" { return true } }
+    if c >= "A" { if c <= "Z" { return true } }
+    if c == "_" { return true }
+    return false
+}
+
+fn is_alnum(c) {
+    if is_digit(&c) { return true }
+    if is_alpha(&c) { return true }
+    return false
+}
+
+fn is_space(c) {
+    if c == " " { return true }
+    if c == "\t" { return true }
+    if c == "\n" { return true }
+    if c == "\r" { return true }
+    return false
+}
+
+fn is_keyword(w) {
+    let kws = ["fn", "let", "mut", "if", "else", "return", "while", "for",
+               "in", "import", "as", "struct", "enum", "match", "impl",
+               "spawn", "true", "false"]
+    for k in kws {
+        if k == w { return true }
+    }
+    return false
+}
+
+fn two_char_op(s) {
+    let ops = ["==", "!=", "<=", ">=", "&&", "||", "->", "=>", "::"]
+    for o in ops {
+        if o == s { return true }
+    }
+    return false
+}
+
+fn tok(kind, text) {
+    let m = map()
+    set(m, "kind", kind)
+    set(m, "text", text)
+    return m
+}
+
+# source string -> array of {kind, text} tokens
+fn lex(src) {
+    let chars = src.chars()
+    let n = len(chars)
+    let mut tokens = []
+    let mut i = 0
+
+    while i < n {
+        if is_space(&chars[i]) {
+            i = i + 1
+        } else {
+            let mut handled = false
+
+            # line comment: `#...` or `//...` to end of line
+            let mut slashslash = false
+            if chars[i] == "/" {
+                if i + 1 < n {
+                    if chars[i + 1] == "/" { slashslash = true }
+                }
+            }
+            if chars[i] == "#" { slashslash = true }
+            if slashslash {
+                let mut go = true
+                while go {
+                    if i >= n { go = false } else {
+                        if chars[i] == "\n" { go = false } else { i = i + 1 }
+                    }
+                }
+                handled = true
+            }
+
+            # string literal: "..."
+            if !handled {
+                if chars[i] == "\"" {
+                    let mut s = ""
+                    i = i + 1
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if chars[i] == "\"" { go = false } else {
+                                s = s + chars[i]
+                                i = i + 1
+                            }
+                        }
+                    }
+                    i = i + 1
+                    push(tokens, tok("str", s))
+                    handled = true
+                }
+            }
+
+            # number
+            if !handled {
+                if is_digit(&chars[i]) {
+                    let mut num = ""
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if is_digit(&chars[i]) {
+                                num = num + chars[i]
+                                i = i + 1
+                            } else { go = false }
+                        }
+                    }
+                    push(tokens, tok("num", num))
+                    handled = true
+                }
+            }
+
+            # identifier or keyword
+            if !handled {
+                if is_alpha(&chars[i]) {
+                    let mut word = ""
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if is_alnum(&chars[i]) {
+                                word = word + chars[i]
+                                i = i + 1
+                            } else { go = false }
+                        }
+                    }
+                    let mut kind = "ident"
+                    if is_keyword(&word) { kind = "keyword" }
+                    push(tokens, tok(kind, word))
+                    handled = true
+                }
+            }
+
+            # two-char operator
+            if !handled {
+                if i + 1 < n {
+                    let pair = chars[i] + chars[i + 1]
+                    if two_char_op(&pair) {
+                        push(tokens, tok("op", pair))
+                        i = i + 2
+                        handled = true
+                    }
+                }
+            }
+
+            # single-char operator / punctuation
+            if !handled {
+                push(tokens, tok("op", chars[i]))
+                i = i + 1
+            }
+        }
+    }
+
+    return tokens
+}
+
+# ===========================================================================
+# SECTION 2 — Token cursor helpers (EOF-safe; never index out of bounds)
+# ===========================================================================
+
+# Return the token at `pos`, or an `eof` sentinel past the end. The token array
+# is always borrowed (`&toks`) so it is never moved/consumed.
+fn at(toks, pos) {
+    if pos < len(toks) {
+        return toks[pos]
+    }
+    return tok("eof", "")
+}
+
+fn kind_at(toks, pos) {
+    let t = at(&toks, &pos)
+    return t["kind"]
+}
+
+fn text_at(toks, pos) {
+    let t = at(&toks, &pos)
+    return t["text"]
+}
+
+# is the token at `pos` the operator `s`?
+fn is_op(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "op" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+# is the token at `pos` the keyword `s`?
+fn is_kw(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "keyword" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+# is the token at `pos` an identifier whose text is `s`?
+fn is_ident_text(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "ident" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+# ===========================================================================
+# SECTION 3 — AST + result constructors
+# ===========================================================================
+
+# Every parse function returns a result map carrying the parsed AST node and the
+# next cursor position: { "node": <ast map>, "pos": <int> }. AST nodes are maps
+# tagged with a "node" field plus child fields/arrays — mirroring how the lexer
+# represents tokens as maps.
+
+fn res(node, pos) {
+    let r = map()
+    set(r, "node", node)
+    set(r, "pos", pos)
+    return r
+}
+
+fn rnode(r) { return r["node"] }
+fn rpos(r) { return r["pos"] }
+
+fn nd_int(v) {
+    let m = map()
+    set(m, "node", "Int")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_str(v) {
+    let m = map()
+    set(m, "node", "Str")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_bool(v) {
+    let m = map()
+    set(m, "node", "Bool")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_ident(name) {
+    let m = map()
+    set(m, "node", "Ident")
+    set(m, "name", name)
+    return m
+}
+
+fn nd_binary(op, left, right) {
+    let m = map()
+    set(m, "node", "Binary")
+    set(m, "op", op)
+    set(m, "left", left)
+    set(m, "right", right)
+    return m
+}
+
+fn nd_unary(op, operand) {
+    let m = map()
+    set(m, "node", "Unary")
+    set(m, "op", op)
+    set(m, "operand", operand)
+    return m
+}
+
+fn nd_call(callee, args) {
+    let m = map()
+    set(m, "node", "Call")
+    set(m, "callee", callee)
+    set(m, "args", args)
+    return m
+}
+
+# A parse error carried as an AST node, so a host crash is never required.
+# Mirrors the project's `E####` + message diagnostic style loosely.
+fn nd_error(msg, toks, pos) {
+    let t = at(&toks, &pos)
+    let m = map()
+    set(m, "node", "Error")
+    set(m, "code", "E0100")
+    set(m, "msg", msg)
+    set(m, "tokkind", t["kind"])
+    set(m, "toktext", t["text"])
+    return m
+}
+
+# Build an error result that also advances the cursor by one, guaranteeing that
+# recovery loops always make progress (no infinite loop on a bad token).
+fn err(msg, toks, pos) {
+    let e = nd_error(&msg, &toks, &pos)
+    return res(e, pos + 1)
+}
+
+# ===========================================================================
+# SECTION 4 — Expression grammar (lowest to highest precedence)
+#
+#   expr        = logic_or
+#   logic_or    = logic_and { "||" logic_and }
+#   logic_and   = equality  { "&&" equality }
+#   equality    = comparison { ("==" | "!=") comparison }
+#   comparison  = term { ("<" | "<=" | ">" | ">=") term }
+#   term        = factor { ("+" | "-") factor }
+#   factor      = unary  { ("*" | "/" | "%") unary }
+#   unary       = ("-" | "!") unary | primary
+#   primary     = int | str | bool | ident | call | "(" expr ")"
+# ===========================================================================
+
+fn parse_expr(toks, pos) {
+    return parse_or(&toks, &pos)
+}
+
+fn parse_or(toks, pos) {
+    let r = parse_and(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "||") {
+            let rr = parse_and(&toks, p + 1)
+            left = nd_binary("||", &left, rnode(&rr))
+            p = rpos(&rr)
+        } else { go = false }
+    }
+    return res(left, p)
+}
+
+fn parse_and(toks, pos) {
+    let r = parse_equality(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "&&") {
+            let rr = parse_equality(&toks, p + 1)
+            left = nd_binary("&&", &left, rnode(&rr))
+            p = rpos(&rr)
+        } else { go = false }
+    }
+    return res(left, p)
+}
+
+fn parse_equality(toks, pos) {
+    let r = parse_comparison(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "==") { op = "==" }
+        if is_op(&toks, &p, "!=") { op = "!=" }
+        if op == "" { go = false } else {
+            let rr = parse_comparison(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_comparison(toks, pos) {
+    let r = parse_term(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "<=") { op = "<=" }
+        if is_op(&toks, &p, ">=") { op = ">=" }
+        if is_op(&toks, &p, "<") { op = "<" }
+        if is_op(&toks, &p, ">") { op = ">" }
+        if op == "" { go = false } else {
+            let rr = parse_term(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_term(toks, pos) {
+    let r = parse_factor(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "+") { op = "+" }
+        if is_op(&toks, &p, "-") { op = "-" }
+        if op == "" { go = false } else {
+            let rr = parse_factor(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_factor(toks, pos) {
+    let r = parse_unary(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "*") { op = "*" }
+        if is_op(&toks, &p, "/") { op = "/" }
+        if is_op(&toks, &p, "%") { op = "%" }
+        if op == "" { go = false } else {
+            let rr = parse_unary(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_unary(toks, pos) {
+    let mut op = ""
+    if is_op(&toks, &pos, "-") { op = "-" }
+    if is_op(&toks, &pos, "!") { op = "!" }
+    if op == "" {
+        return parse_primary(&toks, &pos)
+    }
+    let rr = parse_unary(&toks, pos + 1)
+    return res(nd_unary(&op, rnode(&rr)), rpos(&rr))
+}
+
+# Parse a comma-separated argument list starting just after "(", returning
+# { "args": [...], "pos": <after ")"> }.
+fn parse_args(toks, pos) {
+    let mut args = []
+    let mut p = pos + 0
+    # empty argument list: f()
+    if is_op(&toks, &p, ")") {
+        let out = map()
+        set(out, "args", args)
+        set(out, "pos", p + 1)
+        return out
+    }
+    let mut go = true
+    while go {
+        let r = parse_expr(&toks, &p)
+        push(args, rnode(&r))
+        p = rpos(&r)
+        if is_op(&toks, &p, ",") {
+            p = p + 1
+        } else { go = false }
+    }
+    if is_op(&toks, &p, ")") { p = p + 1 }
+    let out = map()
+    set(out, "args", args)
+    set(out, "pos", p)
+    return out
+}
+
+fn parse_primary(toks, pos) {
+    let k = kind_at(&toks, &pos)
+    let x = text_at(&toks, &pos)
+
+    if k == "num" { return res(nd_int(&x), pos + 1) }
+    if k == "str" { return res(nd_str(&x), pos + 1) }
+
+    if k == "keyword" {
+        if x == "true" { return res(nd_bool("true"), pos + 1) }
+        if x == "false" { return res(nd_bool("false"), pos + 1) }
+        return err("unexpected keyword in expression: " + text_at(&toks, &pos), &toks, &pos)
+    }
+
+    if k == "ident" {
+        # function call?  ident "(" args ")"
+        if is_op(&toks, pos + 1, "(") {
+            let a = parse_args(&toks, pos + 2)
+            return res(nd_call(&x, a["args"]), a["pos"])
+        }
+        return res(nd_ident(&x), pos + 1)
+    }
+
+    if k == "op" {
+        if x == "(" {
+            let r = parse_expr(&toks, pos + 1)
+            let p = rpos(&r)
+            if is_op(&toks, &p, ")") {
+                return res(rnode(&r), p + 1)
+            }
+            return err("expected ')' to close parenthesized expression", &toks, &p)
+        }
+    }
+
+    return err("expected an expression", &toks, &pos)
+}
+
+# ===========================================================================
+# SECTION 5 — Statements, blocks, function declarations, program
+#
+#   stmt   = let_stmt | return_stmt | if_stmt | while_stmt | echo_stmt
+#          | fn_decl | assign_stmt | expr_stmt
+#   block  = "{" { stmt } "}"
+#   fn     = "fn" ident "(" [ params ] ")" [ "->" type ] block
+# ===========================================================================
+
+# Parse a "{ ... }" block, returning { "stmts": [...], "pos": <after "}"> }.
+fn parse_block(toks, pos) {
+    let mut stmts = []
+    let mut p = pos + 0
+    if is_op(&toks, &p, "{") { p = p + 1 } else {
+        push(stmts, nd_error("expected '{' to open block", &toks, &p))
+    }
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "}") { p = p + 1; go = false } else {
+            if kind_at(&toks, &p) == "eof" {
+                push(stmts, nd_error("unexpected end of input inside block", &toks, &p))
+                go = false
+            } else {
+                let before = p + 0
+                let r = parse_stmt(&toks, &p)
+                push(stmts, rnode(&r))
+                p = rpos(&r)
+                # safety: guarantee forward progress so we never spin forever
+                if p <= before { p = before + 1 }
+            }
+        }
+    }
+    let out = map()
+    set(out, "stmts", stmts)
+    set(out, "pos", p)
+    return out
+}
+
+fn parse_let(toks, pos) {
+    let mut p = pos + 1
+    let mut is_mut = false
+    if is_kw(&toks, &p, "mut") { is_mut = true; p = p + 1 }
+
+    let name = text_at(&toks, &p)
+    if kind_at(&toks, &p) == "ident" { p = p + 1 } else {
+        return err("expected a name after 'let'", &toks, &p)
+    }
+
+    # optional type annotation `: type` (skipped in this subset)
+    if is_op(&toks, &p, ":") {
+        p = p + 1
+        if kind_at(&toks, &p) == "ident" { p = p + 1 }
+    }
+
+    if is_op(&toks, &p, "=") { p = p + 1 } else {
+        return err("expected '=' in let binding", &toks, &p)
+    }
+
+    let r = parse_expr(&toks, &p)
+    let m = map()
+    set(m, "node", "Let")
+    set(m, "mut", is_mut)
+    set(m, "name", name)
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_return(toks, pos) {
+    let mut p = pos + 1
+    let m = map()
+    set(m, "node", "Return")
+    # `return` with no value when followed by block-close or EOF
+    let mut has_val = true
+    if is_op(&toks, &p, "}") { has_val = false }
+    if kind_at(&toks, &p) == "eof" { has_val = false }
+    if has_val {
+        let r = parse_expr(&toks, &p)
+        set(m, "value", rnode(&r))
+        p = rpos(&r)
+    }
+    set(m, "has", has_val)
+    return res(m, p)
+}
+
+fn parse_if(toks, pos) {
+    let mut p = pos + 1
+    let c = parse_expr(&toks, &p)
+    p = rpos(&c)
+    let tb = parse_block(&toks, &p)
+    p = tb["pos"]
+
+    let m = map()
+    set(m, "node", "If")
+    set(m, "cond", rnode(&c))
+    set(m, "then", tb["stmts"])
+
+    let mut has_else = false
+    let mut elsestmts = []
+    if is_kw(&toks, &p, "else") {
+        has_else = true
+        p = p + 1
+        if is_kw(&toks, &p, "if") {
+            # else-if: nest the following if-statement as the sole else stmt
+            let ei = parse_if(&toks, &p)
+            push(elsestmts, rnode(&ei))
+            p = rpos(&ei)
+        } else {
+            let eb = parse_block(&toks, &p)
+            elsestmts = eb["stmts"]
+            p = eb["pos"]
+        }
+    }
+    set(m, "hasElse", has_else)
+    set(m, "els", elsestmts)
+    return res(m, p)
+}
+
+fn parse_while(toks, pos) {
+    let mut p = pos + 1
+    let c = parse_expr(&toks, &p)
+    p = rpos(&c)
+    let b = parse_block(&toks, &p)
+    p = b["pos"]
+    let m = map()
+    set(m, "node", "While")
+    set(m, "cond", rnode(&c))
+    set(m, "body", b["stmts"])
+    return res(m, p)
+}
+
+fn parse_echo(toks, pos) {
+    # `echo` is lexed as an identifier (not a reserved keyword); we treat it as
+    # a statement keyword here to match the language's echo statement.
+    let p = pos + 1
+    let r = parse_expr(&toks, &p)
+    let m = map()
+    set(m, "node", "Echo")
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_assign(toks, pos) {
+    # ident "=" expr   (only entered when lookahead confirms a single "=")
+    let name = text_at(&toks, &pos)
+    let r = parse_expr(&toks, pos + 2)
+    let m = map()
+    set(m, "node", "Assign")
+    set(m, "name", name)
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_stmt(toks, pos) {
+    if is_kw(&toks, &pos, "let") { return parse_let(&toks, &pos) }
+    if is_kw(&toks, &pos, "return") { return parse_return(&toks, &pos) }
+    if is_kw(&toks, &pos, "if") { return parse_if(&toks, &pos) }
+    if is_kw(&toks, &pos, "while") { return parse_while(&toks, &pos) }
+    if is_kw(&toks, &pos, "fn") { return parse_fn(&toks, &pos) }
+    if is_ident_text(&toks, &pos, "echo") { return parse_echo(&toks, &pos) }
+
+    # assignment: ident "=" expr  (but NOT "==", which is a single op token)
+    if kind_at(&toks, &pos) == "ident" {
+        if is_op(&toks, pos + 1, "=") {
+            return parse_assign(&toks, &pos)
+        }
+    }
+
+    # fall back to an expression statement
+    let r = parse_expr(&toks, &pos)
+    let m = map()
+    set(m, "node", "ExprStmt")
+    set(m, "expr", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_fn(toks, pos) {
+    let mut p = pos + 1
+    let name = text_at(&toks, &p)
+    if kind_at(&toks, &p) == "ident" { p = p + 1 } else {
+        return err("expected function name after 'fn'", &toks, &p)
+    }
+
+    if is_op(&toks, &p, "(") { p = p + 1 } else {
+        return err("expected '(' after function name", &toks, &p)
+    }
+
+    let mut params = []
+    let mut go = true
+    if is_op(&toks, &p, ")") { go = false }
+    while go {
+        # optional `mut` on a parameter
+        if is_kw(&toks, &p, "mut") { p = p + 1 }
+        if kind_at(&toks, &p) == "ident" {
+            push(params, text_at(&toks, &p))
+            p = p + 1
+        }
+        # optional `: type` (skipped)
+        if is_op(&toks, &p, ":") {
+            p = p + 1
+            if kind_at(&toks, &p) == "ident" { p = p + 1 }
+        }
+        if is_op(&toks, &p, ",") { p = p + 1 } else { go = false }
+    }
+    if is_op(&toks, &p, ")") { p = p + 1 }
+
+    # optional return type `-> type` (skipped in this subset)
+    if is_op(&toks, &p, "->") {
+        p = p + 1
+        if kind_at(&toks, &p) == "ident" { p = p + 1 }
+    }
+
+    let b = parse_block(&toks, &p)
+    let m = map()
+    set(m, "node", "Fn")
+    set(m, "name", name)
+    set(m, "params", params)
+    set(m, "body", b["stmts"])
+    return res(m, b["pos"])
+}
+
+# program = sequence of items (function declarations and statements)
+fn parse_program(toks) {
+    let mut items = []
+    let mut p = 0
+    let mut go = true
+    while go {
+        if kind_at(&toks, &p) == "eof" { go = false } else {
+            let before = p + 0
+            let r = parse_stmt(&toks, &p)
+            push(items, rnode(&r))
+            p = rpos(&r)
+            if p <= before { p = before + 1 }
+        }
+    }
+    let m = map()
+    set(m, "node", "Program")
+    set(m, "items", items)
+    return m
+}
+
+# ===========================================================================
+# SECTION 6 — Pretty-printer (indented S-expression-ish AST dump) + node count
+# ===========================================================================
+
+fn pad_of(depth) {
+    let mut s = ""
+    let mut i = 0
+    while i < depth {
+        s = s + "  "
+        i = i + 1
+    }
+    return s
+}
+
+fn join_commas(items) {
+    let n = len(items)
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + items[i]
+        i = i + 1
+    }
+    return s
+}
+
+# print a list of statement/expression nodes at a given depth
+fn dump_list(stmts, depth) {
+    let n = len(stmts)
+    let mut i = 0
+    while i < n {
+        dump(&stmts[i], depth + 0)
+        i = i + 1
+    }
+}
+
+fn dump(nd, depth) {
+    let pad = pad_of(&depth)
+    let tag = nd["node"]
+
+    if tag == "Program" {
+        echo pad + "(Program"
+        dump_list(nd["items"], depth + 1)
+        return 0
+    }
+    if tag == "Fn" {
+        echo pad + "(Fn " + nd["name"] + " (" + join_commas(nd["params"]) + ")"
+        dump_list(nd["body"], depth + 1)
+        return 0
+    }
+    if tag == "Let" {
+        let mut head = "(Let "
+        if nd["mut"] { head = "(Let mut " }
+        echo pad + head + nd["name"]
+        dump(nd["value"], depth + 1)
+        return 0
+    }
+    if tag == "Assign" {
+        echo pad + "(Assign " + nd["name"]
+        dump(nd["value"], depth + 1)
+        return 0
+    }
+    if tag == "Return" {
+        echo pad + "(Return"
+        if nd["has"] { dump(nd["value"], depth + 1) }
+        return 0
+    }
+    if tag == "If" {
+        echo pad + "(If"
+        echo pad + "  cond"
+        dump(nd["cond"], depth + 2)
+        echo pad + "  then"
+        dump_list(nd["then"], depth + 2)
+        if nd["hasElse"] {
+            echo pad + "  else"
+            dump_list(nd["els"], depth + 2)
+        }
+        return 0
+    }
+    if tag == "While" {
+        echo pad + "(While"
+        echo pad + "  cond"
+        dump(nd["cond"], depth + 2)
+        echo pad + "  body"
+        dump_list(nd["body"], depth + 2)
+        return 0
+    }
+    if tag == "Echo" {
+        echo pad + "(Echo"
+        dump(nd["value"], depth + 1)
+        return 0
+    }
+    if tag == "ExprStmt" {
+        echo pad + "(ExprStmt"
+        dump(nd["expr"], depth + 1)
+        return 0
+    }
+    if tag == "Binary" {
+        echo pad + "(Binary " + nd["op"]
+        dump(nd["left"], depth + 1)
+        dump(nd["right"], depth + 1)
+        return 0
+    }
+    if tag == "Unary" {
+        echo pad + "(Unary " + nd["op"]
+        dump(nd["operand"], depth + 1)
+        return 0
+    }
+    if tag == "Call" {
+        echo pad + "(Call " + nd["callee"]
+        dump_list(nd["args"], depth + 1)
+        return 0
+    }
+    if tag == "Int" { echo pad + "(Int " + nd["value"] + ")"; return 0 }
+    if tag == "Str" { echo pad + "(Str \"" + nd["value"] + "\")"; return 0 }
+    if tag == "Bool" { echo pad + "(Bool " + nd["value"] + ")"; return 0 }
+    if tag == "Ident" { echo pad + "(Ident " + nd["name"] + ")"; return 0 }
+    if tag == "Error" {
+        echo pad + "(Error " + nd["code"] + ": " + nd["msg"] + " near " + nd["tokkind"] + " '" + nd["toktext"] + "')"
+        return 0
+    }
+    echo pad + "(? " + tag + ")"
+    return 0
+}
+
+# count every AST node (maps tagged "node") in the tree
+fn count_list(stmts) {
+    let n = len(stmts)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        c = c + count_nodes(&stmts[i])
+        i = i + 1
+    }
+    return c
+}
+
+fn count_nodes(nd) {
+    let tag = nd["node"]
+    let mut c = 1
+
+    if tag == "Program" { c = c + count_list(nd["items"]) }
+    if tag == "Fn" { c = c + count_list(nd["body"]) }
+    if tag == "Let" { c = c + count_nodes(nd["value"]) }
+    if tag == "Assign" { c = c + count_nodes(nd["value"]) }
+    if tag == "Return" { if nd["has"] { c = c + count_nodes(nd["value"]) } }
+    if tag == "If" {
+        c = c + count_nodes(nd["cond"])
+        c = c + count_list(nd["then"])
+        if nd["hasElse"] { c = c + count_list(nd["els"]) }
+    }
+    if tag == "While" {
+        c = c + count_nodes(nd["cond"])
+        c = c + count_list(nd["body"])
+    }
+    if tag == "Echo" { c = c + count_nodes(nd["value"]) }
+    if tag == "ExprStmt" { c = c + count_nodes(nd["expr"]) }
+    if tag == "Binary" {
+        c = c + count_nodes(nd["left"])
+        c = c + count_nodes(nd["right"])
+    }
+    if tag == "Unary" { c = c + count_nodes(nd["operand"]) }
+    if tag == "Call" { c = c + count_list(nd["args"]) }
+    return c
+}
+
+# ===========================================================================
+# SECTION 7 — Demo / golden output
+# ===========================================================================
+
+fn parse_str(src) {
+    let toks = lex(src)
+    return parse_program(&toks)
+}
+
+fn demo(title, src) {
+    echo "==== " + title + " ===="
+    echo "source: " + src
+    let ast = parse_str(&src)
+    echo "---- AST ----"
+    dump(&ast, 0)
+    echo "---- nodes ----"
+    echo count_nodes(&ast)
+    echo ""
+}
+
+fn main() {
+    # 1) function declaration + operator on a return
+    demo("function declaration", "fn add(a, b) { return a + b }")
+
+    # 2) let / if-else / while / call / reassignment
+    let prog2 = "fn main() { let mut i = 0 while i < 10 { i = i + 1 } if i == 10 { echo greet(i) } else { echo 0 } }"
+    demo("let / if-else / while / call", &prog2)
+
+    # 3) operator precedence: 1 + 2 * 3  parses as 1 + (2 * 3)
+    demo("operator precedence", "let x = 1 + 2 * 3")
+
+    # 4) deeper precedence + unary + comparison + logical
+    demo("mixed precedence", "let ok = !done && a + b * c == d || e < f")
+
+    # 5) a deliberate syntax error is reported as an Error node (no host crash):
+    #    the right-hand operand of `+` is missing, so the parser inserts an
+    #    Error node in its place and keeps the surrounding structure.
+    demo("error recovery", "let y = 1 + ")
+}
