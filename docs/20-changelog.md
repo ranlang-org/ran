@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.4 — Native string memory safety (no leaks, refcount-clean)
+
+Backward-compatible; native output is byte-for-byte unchanged. The native AOT path used
+to allocate unboxed `const char*` strings (concat, `$`-interpolation, value formatting,
+and `str`/`json`/`os`/`fs` results) and never free them — an unbounded leak in
+long-running programs. Native string handling is now fully memory-safe, the prerequisite
+for the native HTTP server. Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Per-thread autorelease pool:** every fresh heap string registers in a
+  `_Thread_local` pool drained at each statement boundary; transient strings are
+  reclaimed at once (a long loop stays at a few MB instead of leaking per iteration).
+- **Owned variable strings:** strings bound to a variable or returned from a function
+  are copied to an owned, non-pooled buffer (`ran_str_dup`) and freed at scope/function
+  exit, on reassignment, and on `break`/`continue`/`return`; literals and borrows are
+  never pooled or freed (mirrors interpreter clone-on-bind + the `RanValue` discipline).
+- **Runtime leak fixes:** `log.*`, `os.hostname`, `os.args`, `fs.read` free their string
+  builders; `json.encode` of decimals and the interpolation path no longer leak (the
+  latter also fixes a latent use-after-free).
+- Verified: byte-for-byte parity (strings, interpolation, arrays, structs, maps, JSON,
+  decimal, SQLite `db`); ASan + UBSan + LSan clean; flat RSS across a 3,000,000-iteration
+  string loop; 407 tests green.
+
 ## 0.3.3 — Self-hosting: a Ran semantic checker written in Ran
 
 Milestone: **the Ran compiler's semantic checker is now written in Ran.** Joining the

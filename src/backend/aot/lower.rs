@@ -630,19 +630,30 @@ struct Scopes {
     /// Parallel to `stack`: C identifiers of Value-typed `let` locals declared
     /// in each scope (params are NOT tracked — the caller owns them).
     val_locals: Vec<Vec<String>>,
+    /// Parallel to `stack`: C identifiers of Str-typed `let` locals. Each owns
+    /// an independent heap copy (`ran_str_dup`) freed with `ran_str_free` on
+    /// scope/function exit, reassignment, and break/continue/return. Params are
+    /// NOT tracked (they borrow the caller's string).
+    str_locals: Vec<Vec<String>>,
 }
 
 impl Scopes {
     fn new() -> Self {
-        Scopes { stack: vec![HashMap::new()], val_locals: vec![Vec::new()] }
+        Scopes {
+            stack: vec![HashMap::new()],
+            val_locals: vec![Vec::new()],
+            str_locals: vec![Vec::new()],
+        }
     }
     fn push(&mut self) {
         self.stack.push(HashMap::new());
         self.val_locals.push(Vec::new());
+        self.str_locals.push(Vec::new());
     }
     fn pop(&mut self) {
         self.stack.pop();
         self.val_locals.pop();
+        self.str_locals.pop();
     }
     fn lookup(&self, name: &str) -> Option<CType> {
         for scope in self.stack.iter().rev() {
@@ -660,12 +671,18 @@ impl Scopes {
     fn declare_param(&mut self, name: &str, t: CType) {
         self.stack.last_mut().unwrap().insert(name.to_string(), t);
     }
-    /// Declare a `let` local; Value-typed locals are tracked for release.
+    /// Declare a `let` local; Value- and Str-typed locals are tracked for release.
     fn declare_local(&mut self, name: &str, t: CType) {
         self.stack.last_mut().unwrap().insert(name.to_string(), t);
         if t == CType::Value {
             let cn = c_ident(name);
             let top = self.val_locals.last_mut().unwrap();
+            if !top.contains(&cn) {
+                top.push(cn);
+            }
+        } else if t == CType::Str {
+            let cn = c_ident(name);
+            let top = self.str_locals.last_mut().unwrap();
             if !top.contains(&cn) {
                 top.push(cn);
             }
@@ -1128,12 +1145,16 @@ impl<'a> Emit<'a> {
         for n in names.iter().rev() {
             self.line(depth, &format!("ran_release({});", n));
         }
+        let strs: Vec<String> = self.scopes.str_locals.last().cloned().unwrap_or_default();
+        for n in strs.iter().rev() {
+            self.line(depth, &format!("ran_str_free({});", n));
+        }
     }
     fn scope_pop(&mut self, depth: usize) {
         self.release_top_scope(depth);
         self.scopes.pop();
     }
-    /// Release all Value locals in scope (used before a `return`).
+    /// Release all Value/Str locals in scope (used before a `return`).
     fn emit_return_cleanup(&mut self, depth: usize) {
         let snapshot: Vec<Vec<String>> = self.scopes.val_locals.clone();
         for scope in snapshot.iter().rev() {
@@ -1141,9 +1162,15 @@ impl<'a> Emit<'a> {
                 self.line(depth, &format!("ran_release({});", n));
             }
         }
+        let strs: Vec<Vec<String>> = self.scopes.str_locals.clone();
+        for scope in strs.iter().rev() {
+            for n in scope.iter().rev() {
+                self.line(depth, &format!("ran_str_free({});", n));
+            }
+        }
     }
-    /// Release Value locals from the top scope down to the innermost loop body
-    /// (used before a `break`/`continue`).
+    /// Release Value/Str locals from the top scope down to the innermost loop
+    /// body (used before a `break`/`continue`).
     fn emit_loop_cleanup(&mut self, depth: usize) {
         let mark = *self.loop_marks.last().unwrap_or(&0);
         let snapshot: Vec<Vec<String>> = self.scopes.val_locals.clone();
@@ -1152,6 +1179,19 @@ impl<'a> Emit<'a> {
                 self.line(depth, &format!("ran_release({});", n));
             }
         }
+        let strs: Vec<Vec<String>> = self.scopes.str_locals.clone();
+        for idx in (mark..strs.len()).rev() {
+            for n in strs[idx].iter().rev() {
+                self.line(depth, &format!("ran_str_free({});", n));
+            }
+        }
+    }
+    /// Drain transient heap strings created since function entry back to the
+    /// `_sp0` mark. Owned variable strings are `ran_str_dup`'d (unpooled) so a
+    /// drain never frees them; only per-statement temporaries are reclaimed,
+    /// keeping long-running loops bounded.
+    fn drain_strings(&mut self, depth: usize) {
+        self.line(depth, "ran_str_drain(_sp0);");
     }
 
     // -- Scalar emission: returns inline C code for a scalar-typed expression. --
@@ -1217,7 +1257,15 @@ impl<'a> Emit<'a> {
                 let ty = sig.ret.ok_or_else(|| {
                     codegen_err(self.file, l, c, &format!("`{}` returns nothing and cannot be used as a value", name))
                 })?;
-                Ok((format!("{}({})", c_ident(name), parts.join(", ")), ty))
+                let call = format!("{}({})", c_ident(name), parts.join(", "));
+                // A user function returns its string via `ran_str_dup` (an owned,
+                // unpooled buffer, since the callee already drained its own pool).
+                // Adopt it into THIS frame's pool so the enclosing statement's
+                // drain reclaims it (or a binding `ran_str_dup`s its own copy).
+                if ty == CType::Str {
+                    return Ok((format!("ran_str_autorelease({})", call), ty));
+                }
+                Ok((call, ty))
             }
             // D4a: scalar-returning bridged module method (e.g. time.now_ms(),
             // json.encode(x), str.upper(s)). Value-returning methods are routed
@@ -1743,19 +1791,48 @@ impl<'a> Emit<'a> {
                             self.scopes.declare_local(name, CType::Value);
                         }
                     }
+                    self.release_range(depth, start, self.tmp);
+                    self.drain_strings(depth);
                 } else {
                     let (code, sty) = self.emit_scalar(value, depth)?;
-                    match self.scopes.lookup(name) {
-                        Some(existing) if existing == sty => {
-                            self.line(depth, &format!("{} = {};", c_ident(name), code));
-                        }
-                        _ => {
-                            self.line(depth, &format!("{} {} = {};", sty.c_decl(), c_ident(name), code));
+                    if sty == CType::Str {
+                        let cn = c_ident(name);
+                        if self.scopes.lookup(name).is_some() {
+                            // Reassignment of an existing binding. Build the
+                            // owned copy first (the RHS may read the old value),
+                            // then free the previous owned string and store the
+                            // new one. A non-tracked name is a parameter (borrows
+                            // the caller's string): never free it, but track the
+                            // fresh dup at function scope so it is reclaimed.
+                            let tracked =
+                                self.scopes.str_locals.iter().any(|s| s.contains(&cn));
+                            let nv = self.fresh_s();
+                            self.line(depth, &format!("const char* {} = ran_str_dup({});", nv, code));
+                            if tracked {
+                                self.line(depth, &format!("ran_str_free({});", cn));
+                            }
+                            self.line(depth, &format!("{} = {};", cn, nv));
+                            if !tracked {
+                                self.scopes.str_locals[0].push(cn);
+                            }
+                        } else {
+                            self.line(depth, &format!("const char* {} = ran_str_dup({});", cn, code));
                             self.scopes.declare_local(name, sty);
                         }
+                    } else {
+                        match self.scopes.lookup(name) {
+                            Some(existing) if existing == sty => {
+                                self.line(depth, &format!("{} = {};", c_ident(name), code));
+                            }
+                            _ => {
+                                self.line(depth, &format!("{} {} = {};", sty.c_decl(), c_ident(name), code));
+                                self.scopes.declare_local(name, sty);
+                            }
+                        }
                     }
+                    self.release_range(depth, start, self.tmp);
+                    self.drain_strings(depth);
                 }
-                self.release_range(depth, start, self.tmp);
                 Ok(())
             }
             Statement::Echo { expr, escapes } => {
@@ -1778,6 +1855,7 @@ impl<'a> Emit<'a> {
                     self.line(depth, &format!("ran_echo({});", built));
                 }
                 self.release_range(depth, start, self.tmp);
+                self.drain_strings(depth);
                 Ok(())
             }
             Statement::Return(Some(e)) => {
@@ -1788,14 +1866,22 @@ impl<'a> Emit<'a> {
                     let r = self.fresh_s();
                     self.line(depth, &format!("RanValue {} = ran_clone({});", r, t));
                     self.release_range(depth, start, temps_end);
+                    self.drain_strings(depth);
                     self.emit_return_cleanup(depth);
                     self.line(depth, &format!("return {};", r));
                 } else {
                     let (code, sty) = self.emit_scalar(e, depth)?;
                     let temps_end = self.tmp;
                     let r = self.fresh_s();
-                    self.line(depth, &format!("{} {} = {};", sty.c_decl(), r, code));
+                    if sty == CType::Str {
+                        // Hand back an owned, unpooled copy so it survives this
+                        // frame's pool drain and the caller adopts it.
+                        self.line(depth, &format!("const char* {} = ran_str_dup({});", r, code));
+                    } else {
+                        self.line(depth, &format!("{} {} = {};", sty.c_decl(), r, code));
+                    }
                     self.release_range(depth, start, temps_end);
+                    self.drain_strings(depth);
                     self.emit_return_cleanup(depth);
                     self.line(depth, &format!("return {};", r));
                 }
@@ -1803,6 +1889,7 @@ impl<'a> Emit<'a> {
             }
             Statement::Return(None) => {
                 self.emit_return_cleanup(depth);
+                self.drain_strings(depth);
                 if self.is_main {
                     self.line(depth, "return 0;");
                 } else {
@@ -1812,11 +1899,13 @@ impl<'a> Emit<'a> {
             }
             Statement::Break => {
                 self.emit_loop_cleanup(depth);
+                self.drain_strings(depth);
                 self.line(depth, "break;");
                 Ok(())
             }
             Statement::Continue => {
                 self.emit_loop_cleanup(depth);
+                self.drain_strings(depth);
                 self.line(depth, "continue;");
                 Ok(())
             }
@@ -1850,6 +1939,7 @@ impl<'a> Emit<'a> {
                         }
                     }
                     self.release_range(depth, start, self.tmp);
+                    self.drain_strings(depth);
                     return Ok(());
                 }
                 let start = self.tmp;
@@ -1862,6 +1952,7 @@ impl<'a> Emit<'a> {
                     self.line(depth, &format!("(void)({});", code));
                 }
                 self.release_range(depth, start, self.tmp);
+                self.drain_strings(depth);
                 Ok(())
             }
             Statement::If { condition, then_body, else_body } => {
@@ -1871,6 +1962,7 @@ impl<'a> Emit<'a> {
                 let cv = self.fresh_s();
                 self.line(depth, &format!("bool {} = {};", cv, cond));
                 self.release_range(depth, start, cend);
+                self.drain_strings(depth);
                 self.line(depth, &format!("if ({}) {{", cv));
                 self.scopes.push();
                 self.emit_block(then_body, depth + 1)?;
@@ -1892,6 +1984,7 @@ impl<'a> Emit<'a> {
                 let cv = self.fresh_s();
                 self.line(depth + 1, &format!("bool {} = {};", cv, cond));
                 self.release_range(depth + 1, start, cend);
+                self.drain_strings(depth + 1);
                 self.line(depth + 1, &format!("if (!{}) break;", cv));
                 self.scopes.push();
                 self.loop_marks.push(self.scopes.stack.len() - 1);
@@ -1920,6 +2013,7 @@ impl<'a> Emit<'a> {
                 self.line(depth, &format!("int64_t {} = {};", sa, startcode));
                 self.line(depth, &format!("int64_t {} = {};", sb, endcode));
                 self.release_range(depth, bstart, bend);
+                self.drain_strings(depth);
                 let cv = c_ident(variable);
                 self.line(
                     depth,
@@ -1954,11 +2048,18 @@ impl<'a> Emit<'a> {
             let t = self.emit_value(subject, depth)?;
             self.line(depth, &format!("RanValue {} = ran_clone({});", subj, t));
             self.scopes.val_locals.last_mut().unwrap().push(subj.clone());
+        } else if sty == CType::Str {
+            let (code, _) = self.emit_scalar(subject, depth)?;
+            // Own the subject so it outlives every arm's per-statement drain;
+            // freed once at the match's scope exit.
+            self.line(depth, &format!("const char* {} = ran_str_dup({});", subj, code));
+            self.scopes.str_locals.last_mut().unwrap().push(subj.clone());
         } else {
             let (code, _) = self.emit_scalar(subject, depth)?;
             self.line(depth, &format!("{} {} = {};", sty.c_decl(), subj, code));
         }
         self.release_range(depth, start, self.tmp);
+        self.drain_strings(depth);
         self.emit_arms(arms, &subj, sty, depth)?;
         self.scope_pop(depth);
         Ok(())
@@ -2042,8 +2143,10 @@ impl<'a> Emit<'a> {
             let proto = fn_prototype(name, params, self.sigs, self.structs);
             self.line(0, &format!("{} {{", proto));
         }
+        self.line(1, "size_t _sp0 = ran_str_pool_mark();");
         self.emit_block(body, 1)?;
         self.release_top_scope(1);
+        self.drain_strings(1);
         if self.is_main {
             self.line(1, "return 0;");
         }

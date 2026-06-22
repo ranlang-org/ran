@@ -63,6 +63,24 @@ const char *ran_float_to_str(double x);
 /* Apply bash-style `echo -e` whitespace escapes (\n \t \r) to a string. */
 const char *ran_apply_escapes(const char *s);
 
+/* ---- Heap-string autorelease pool. ----------------------------------- */
+/* The unboxed `const char*` string fast path (concat/format/interpolation/
+ * stdlib results) allocates on the heap. To avoid leaks in long-running
+ * programs (e.g. a server's per-request work), every freshly allocated heap
+ * string is registered in a per-thread autorelease pool; generated code drains
+ * the pool at statement boundaries. A string that must outlive its statement
+ * (a `let`/assignment binding, a function return) is copied to an owned,
+ * NON-pooled buffer via `ran_str_dup` and freed explicitly with `ran_str_free`
+ * at scope/function exit. String LITERALS and borrowed reads are never pooled,
+ * retained, or freed. The pool is `_Thread_local`, so each spawned thread keeps
+ * its own (future native concurrency stays leak-free per thread). */
+const char *ran_str_keep(const char *p);        /* register a fresh heap string */
+const char *ran_str_autorelease(const char *p); /* alias: adopt a returned string */
+size_t      ran_str_pool_mark(void);            /* current pool depth */
+void        ran_str_drain(size_t mark);         /* free + drop entries back to mark */
+char       *ran_str_dup(const char *s);         /* owned, NON-pooled copy (for vars) */
+void        ran_str_free(const char *p);        /* free an owned (dup'd) string */
+
 /* Checked integer arithmetic. On overflow -> E1010; on /0 or %0 -> E1011. */
 int64_t ran_checked_add(int64_t a, int64_t b);
 int64_t ran_checked_sub(int64_t a, int64_t b);

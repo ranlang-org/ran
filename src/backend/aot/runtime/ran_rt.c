@@ -44,6 +44,58 @@ static void *ran_xalloc(size_t n) {
 }
 
 /* ====================================================================== */
+/* Heap-string autorelease pool (see ran_rt.h).                           */
+/*                                                                        */
+/* A per-thread growable array of heap-string pointers. Producers register */
+/* their freshly allocated result with `ran_str_keep`; generated code marks */
+/* the pool depth at the start of a statement and `ran_str_drain`s back to  */
+/* that mark at the end, freeing every transient string created in between. */
+/* Strings that escape the statement (variable bindings, returns) are copied */
+/* with `ran_str_dup` to an owned, unpooled buffer and freed with            */
+/* `ran_str_free`. This keeps long-running loops (a server's accept loop)    */
+/* bounded instead of leaking one allocation per iteration.                  */
+/* ====================================================================== */
+static _Thread_local const char **g_spool = NULL;
+static _Thread_local size_t       g_spool_len = 0;
+static _Thread_local size_t       g_spool_cap = 0;
+
+const char *ran_str_keep(const char *p) {
+    if (g_spool_len == g_spool_cap) {
+        size_t nc = g_spool_cap ? g_spool_cap * 2 : 32;
+        const char **n = (const char **)ran_xalloc(nc * sizeof(*n));
+        if (g_spool) {
+            memcpy(n, g_spool, g_spool_len * sizeof(*n));
+            free(g_spool);
+        }
+        g_spool = n;
+        g_spool_cap = nc;
+    }
+    g_spool[g_spool_len++] = p;
+    return p;
+}
+
+const char *ran_str_autorelease(const char *p) { return ran_str_keep(p); }
+
+size_t ran_str_pool_mark(void) { return g_spool_len; }
+
+void ran_str_drain(size_t mark) {
+    while (g_spool_len > mark) {
+        free((void *)g_spool[--g_spool_len]);
+        g_spool[g_spool_len] = NULL;
+    }
+}
+
+char *ran_str_dup(const char *s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *o = (char *)ran_xalloc(n + 1);
+    memcpy(o, s, n + 1);
+    return o;
+}
+
+void ran_str_free(const char *p) { free((void *)p); }
+
+/* ====================================================================== */
 /* D1 unboxed scalar helpers.                                             */
 /* ====================================================================== */
 
@@ -61,7 +113,7 @@ const char *ran_concat(const char *a, const char *b) {
     memcpy(out, a, la);
     memcpy(out + la, b, lb);
     out[la + lb] = '\0';
-    return out;
+    return ran_str_keep(out);
 }
 
 const char *ran_int_to_str(int64_t n) {
@@ -69,7 +121,7 @@ const char *ran_int_to_str(int64_t n) {
     int len = snprintf(buf, sizeof(buf), "%lld", (long long)n);
     char *out = (char *)ran_xalloc((size_t)len + 1);
     memcpy(out, buf, (size_t)len + 1);
-    return out;
+    return ran_str_keep(out);
 }
 
 const char *ran_bool_to_str(bool b) {
@@ -83,15 +135,15 @@ const char *ran_bool_to_str(bool b) {
  * Strategy: find the smallest number of significant digits whose `%.*e`
  * rendering round-trips through `strtod`, then reassemble fixed-notation. */
 const char *ran_float_to_str(double x) {
-    if (isnan(x)) { char *o = (char *)ran_xalloc(4); memcpy(o, "NaN", 4); return o; }
+    if (isnan(x)) { char *o = (char *)ran_xalloc(4); memcpy(o, "NaN", 4); return ran_str_keep(o); }
     if (isinf(x)) {
         const char *t = x < 0 ? "-inf" : "inf";
-        size_t n = strlen(t) + 1; char *o = (char *)ran_xalloc(n); memcpy(o, t, n); return o;
+        size_t n = strlen(t) + 1; char *o = (char *)ran_xalloc(n); memcpy(o, t, n); return ran_str_keep(o);
     }
     if (x == 0.0) {
         /* Preserve sign of zero like Rust ("-0" for negative zero). */
         const char *t = signbit(x) ? "-0" : "0";
-        size_t n = strlen(t) + 1; char *o = (char *)ran_xalloc(n); memcpy(o, t, n); return o;
+        size_t n = strlen(t) + 1; char *o = (char *)ran_xalloc(n); memcpy(o, t, n); return ran_str_keep(o);
     }
 
     char ebuf[64];
@@ -147,7 +199,7 @@ const char *ran_float_to_str(double x) {
 
     char *res = (char *)ran_xalloc(oi + 1);
     memcpy(res, out, oi + 1);
-    return res;
+    return ran_str_keep(res);
 }
 
 const char *ran_apply_escapes(const char *s) {
@@ -165,7 +217,7 @@ const char *ran_apply_escapes(const char *s) {
         out[j++] = s[i];
     }
     out[j] = '\0';
-    return out;
+    return ran_str_keep(out);
 }
 
 int64_t ran_checked_add(int64_t a, int64_t b) {
@@ -782,7 +834,7 @@ const char *ran_interp_path(RanValue base, const char *fields, const char *fallb
             return fallback;
         }
     }
-    const char *s = ran_value_to_str(cur);
+    const char *s = ran_str_keep(ran_str_dup(ran_value_to_str(cur)));
     ran_release(cur);
     return s;
 }
@@ -989,7 +1041,7 @@ const char *ran_value_to_str(RanValue v) {
         case RAN_INT:   return ran_int_to_str(v.u.i);
         case RAN_FLOAT: return ran_float_to_str(v.u.f);
         case RAN_BOOL:  return v.u.b ? "true" : "false";
-        case RAN_DEC:   return dec_to_str((Dec){v.u.dec.mant, v.u.dec.scale});
+        case RAN_DEC:   return ran_str_keep(dec_to_str((Dec){v.u.dec.mant, v.u.dec.scale}));
         case RAN_STR:   return v.u.s->data;
         case RAN_VOID:  return "()";
         case RAN_ARRAY: {
@@ -1000,7 +1052,7 @@ const char *ran_value_to_str(RanValue v) {
                 sb_push(&b, ran_value_to_str(v.u.a->items[k]));
             }
             sb_push(&b, "]");
-            return b.buf;
+            return ran_str_keep(b.buf);
         }
         case RAN_OBJECT: {
             SB b; sb_init(&b);
@@ -1013,7 +1065,7 @@ const char *ran_value_to_str(RanValue v) {
                 sb_push(&b, ran_value_to_str(v.u.o->vals[k]));
             }
             sb_push(&b, "}");
-            return b.buf;
+            return ran_str_keep(b.buf);
         }
         case RAN_MAP: {
             /* Mirrors `Value::Map` Display: {"k": v, ...}. ORDER is insertion
@@ -1029,7 +1081,7 @@ const char *ran_value_to_str(RanValue v) {
                 sb_push(&b, ran_value_to_str(v.u.m->vals[k]));
             }
             sb_push(&b, "}");
-            return b.buf;
+            return ran_str_keep(b.buf);
         }
     }
     return "";
@@ -1151,7 +1203,7 @@ static const char *dup_range(const char *start, const char *end) {
     char *out = (char *)ran_xalloc(n + 1);
     memcpy(out, start, n);
     out[n] = '\0';
-    return out;
+    return ran_str_keep(out);
 }
 static const char *dup_str(const char *s) {
     if (!s) s = "";
@@ -1228,6 +1280,7 @@ static void log_at(const char *level, const char *color, const RanValue *argv, i
         sb_push(&b, ran_value_to_str(argv[i]));
     }
     fprintf(stderr, "%s%-5s\x1b[0m [%s] %s\n", color, level, iso, b.buf);
+    free(b.buf);
 }
 
 void ran_mod_log_debug(const RanValue *argv, int64_t argc) { log_at("DEBUG", "\x1b[36m",   argv, argc); }
@@ -1295,7 +1348,7 @@ const char *ran_mod_str_upper(const RanValue *argv, int64_t argc) {
     char *out = (char *)ran_xalloc(n + 1);
     for (size_t i = 0; i < n; i++) out[i] = (char)toupper((unsigned char)s[i]);
     out[n] = '\0';
-    return out;
+    return ran_str_keep(out);
 }
 const char *ran_mod_str_lower(const RanValue *argv, int64_t argc) {
     const char *s = marg_str(argv, argc, 0, "");
@@ -1303,7 +1356,7 @@ const char *ran_mod_str_lower(const RanValue *argv, int64_t argc) {
     char *out = (char *)ran_xalloc(n + 1);
     for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)s[i]);
     out[n] = '\0';
-    return out;
+    return ran_str_keep(out);
 }
 
 static bool is_ascii_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
@@ -1383,7 +1436,7 @@ const char *ran_mod_str_replace(const RanValue *argv, int64_t argc) {
             sb_push(&b, to);
             p += l;
         }
-        return b.buf;
+        return ran_str_keep(b.buf);
     }
     const char *p = s;
     while (1) {
@@ -1395,7 +1448,7 @@ const char *ran_mod_str_replace(const RanValue *argv, int64_t argc) {
         sb_push(&b, to);
         p = hit + lf;
     }
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 
 RanValue ran_mod_str_split(const RanValue *argv, int64_t argc) {
@@ -1438,7 +1491,7 @@ const char *ran_mod_str_join(const RanValue *argv, int64_t argc) {
             sb_push(&b, ran_value_to_str(arr.u.a->items[i]));
         }
     }
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 
 const char *ran_mod_str_repeat(const RanValue *argv, int64_t argc) {
@@ -1450,7 +1503,7 @@ const char *ran_mod_str_repeat(const RanValue *argv, int64_t argc) {
     for (int64_t i = 0; i < n; i++) {
         if (ls) sb_push(&b, s);
     }
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 
 const char *ran_mod_str_reverse(const RanValue *argv, int64_t argc) {
@@ -1466,7 +1519,7 @@ const char *ran_mod_str_reverse(const RanValue *argv, int64_t argc) {
         memcpy(out + oi, p, l);
         p += l;
     }
-    return out;
+    return ran_str_keep(out);
 }
 
 /* Take the first codepoint of `pad` (default ' '), as a small heap string. */
@@ -1486,7 +1539,7 @@ const char *ran_mod_str_pad_left(const RanValue *argv, int64_t argc) {
     SB b; sb_init(&b);
     for (int64_t i = 0; i < width - (int64_t)len; i++) sb_push(&b, padc);
     sb_push(&b, s);
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 const char *ran_mod_str_pad_right(const RanValue *argv, int64_t argc) {
     const char *s = marg_str(argv, argc, 0, "");
@@ -1498,7 +1551,7 @@ const char *ran_mod_str_pad_right(const RanValue *argv, int64_t argc) {
     SB b; sb_init(&b);
     sb_push(&b, s);
     for (int64_t i = 0; i < width - (int64_t)len; i++) sb_push(&b, padc);
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 
 int64_t ran_mod_str_to_int(const RanValue *argv, int64_t argc) {
@@ -1591,7 +1644,9 @@ const char *ran_mod_os_hostname(const RanValue *argv, int64_t argc) {
         char *e = b.buf + strlen(b.buf);
         while (a < e && is_ascii_ws(*a)) a++;
         while (e > a && is_ascii_ws(e[-1])) e--;
-        return dup_range(a, e);
+        const char *host = dup_range(a, e);
+        free(b.buf);
+        return host;
     }
     const char *h = getenv("HOSTNAME");
     if (h) return dup_str(h);
@@ -1653,6 +1708,7 @@ RanValue ran_mod_os_args(const RanValue *argv, int64_t argc) {
         }
     }
     if (b.len > 0) ran_array_push(arr, ran_from_str(b.buf));
+    free(b.buf);
     fclose(f);
     return arr;
 }
@@ -1677,7 +1733,9 @@ RanValue ran_mod_fs_read(const RanValue *argv, int64_t argc) {
         sb_push(&b, tmp); free(tmp);
     }
     fclose(f);
-    return ran_from_str(b.buf);
+    RanValue v = ran_from_str(b.buf);
+    free(b.buf);
+    return v;
 }
 
 bool ran_mod_fs_write(const RanValue *argv, int64_t argc) {
@@ -1867,7 +1925,7 @@ static void json_encode_into(SB *b, RanValue v) {
         case RAN_VOID:  sb_push(b, "null"); break;
         case RAN_INT:   sb_push(b, ran_int_to_str(v.u.i)); break;
         case RAN_FLOAT: sb_push(b, ran_float_to_str(v.u.f)); break;
-        case RAN_DEC:   sb_push(b, dec_to_str((Dec){v.u.dec.mant, v.u.dec.scale})); break;
+        case RAN_DEC:   sb_push(b, ran_str_keep(dec_to_str((Dec){v.u.dec.mant, v.u.dec.scale}))); break;
         case RAN_BOOL:  sb_push(b, v.u.b ? "true" : "false"); break;
         case RAN_STR:   json_escape_into(b, v.u.s->data); break;
         case RAN_ARRAY: {
@@ -1909,7 +1967,7 @@ static void json_encode_into(SB *b, RanValue v) {
 const char *ran_mod_json_encode(const RanValue *argv, int64_t argc) {
     SB b; sb_init(&b);
     json_encode_into(&b, marg_val(argv, argc, 0));
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 const char *ran_mod_json_stringify(const RanValue *argv, int64_t argc) {
     return ran_mod_json_encode(argv, argc);
@@ -1969,7 +2027,7 @@ static void json_pretty_into(SB *b, RanValue v, int indent) {
 const char *ran_mod_json_pretty(const RanValue *argv, int64_t argc) {
     SB b; sb_init(&b);
     json_pretty_into(&b, marg_val(argv, argc, 0), 0);
-    return b.buf;
+    return ran_str_keep(b.buf);
 }
 
 /* ====================================================================== */

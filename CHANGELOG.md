@@ -11,11 +11,39 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next (self-hosting track): `bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D
-bootstrap fixed point that defines 1.0.0. Native track: HTTP client (TLS) + server
-(after fixing the native string-refcount leak), `concurrency` (pthreads),
-completed-then-bridged `crypto`, `--link-static`, and making native the default once
-the subset matures.
+Next (native track): the HTTP client (TLS via system OpenSSL FFI) and HTTP server,
+then `concurrency` (`spawn`/channels via pthreads). `crypto` stays a thin FFI bridge
+to a vetted, mature library (no hand-rolled crypto). Self-hosting track:
+`bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D bootstrap fixed point that
+defines 1.0.0. Plus `--link-static` and making native the default once the subset matures.
+
+## [0.3.4] — Native string memory safety (no leaks, refcount-clean)
+
+Backward-compatible; native output is byte-for-byte unchanged. The native AOT path
+previously handled unboxed `const char*` strings (concat, `$`-interpolation, value
+formatting, and the `str`/`json`/`os`/`fs` stdlib results) without ever freeing them —
+a leak that grew without bound in long-running programs (e.g. a server's per-request
+work). This release makes native string handling fully memory-safe, which is the
+prerequisite for the upcoming native HTTP server.
+
+### Fixed — heap-string lifetime in native binaries
+
+- **Per-thread autorelease pool.** Every freshly allocated heap string registers in a
+  `_Thread_local` pool; generated code drains the pool at each statement boundary, so
+  transient strings are reclaimed immediately. A long loop now holds steady at a few
+  MB instead of leaking one (or several) allocations per iteration.
+- **Owned variable strings.** A string bound to a `let`/assignment, or returned from a
+  function, is copied to an owned, non-pooled buffer (`ran_str_dup`) and freed at scope
+  / function exit, on reassignment, and on `break`/`continue`/`return`. String literals
+  and borrowed reads are never pooled or freed. Mirrors the interpreter's clone-on-bind
+  semantics and the existing `RanValue` refcount discipline.
+- **Runtime leak fixes.** `log.*`, `os.hostname`, `os.args`, and `fs.read` freed their
+  internal string builders; `json.encode` of decimals and the string-valued
+  interpolation path (`ran_interp_path`) no longer leak (the latter also fixes a latent
+  use-after-free that returned a pointer into a just-released value).
+- Verified: byte-for-byte parity with the interpreter across strings, interpolation,
+  arrays, structs, maps, JSON, decimal money, and SQLite `db`; ASan + UBSan + LSan clean
+  on each; peak RSS flat across a 3,000,000-iteration string loop; all 407 tests green.
 
 ## [0.3.3] — Self-hosting: a Ran semantic checker written in Ran
 

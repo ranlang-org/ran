@@ -23,7 +23,7 @@ ran hello.ran
 # Hello, World!
 ```
 
-> Status: Ran is v0.3.3 and under active development. These docs describe what works
+> Status: Ran is v0.3.4 and under active development. These docs describe what works
 > **today**. Anything partial or planned is labelled with a "Status" note. The full
 > status list is in [16 - Roadmap](16-roadmap.md), and the feature summary is in the
 > [20 - Changelog](20-changelog.md). Version 1.0.0 is reserved for the fully
