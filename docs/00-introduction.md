@@ -23,7 +23,7 @@ ran hello.ran
 # Hello, World!
 ```
 
-> Status: Ran is v0.3.1 and under active development. These docs describe what works
+> Status: Ran is v0.3.2 and under active development. These docs describe what works
 > **today**. Anything partial or planned is labelled with a "Status" note. The full
 > status list is in [16 - Roadmap](16-roadmap.md), and the feature summary is in the
 > [20 - Changelog](20-changelog.md). Version 1.0.0 is reserved for the fully
@@ -73,7 +73,7 @@ separate compiler toolchain to install.
 
 - **Partial:** `html.render` (variable interpolation only).
 - **Cosmetic today:** ownership / borrowing (`&`, `&mut`, `*` parse but do nothing).
-- **Note:** `&&` / `||` work but are not short-circuit (both sides evaluate).
+- **Note:** `&&` / `||` short-circuit (the right side is evaluated only when needed).
 - **Planned:** structs / enums / `match`, closures, channels, the hardware bindings,
   HTTP middleware, remote packages, and activating the bytecode VM.
 

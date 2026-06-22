@@ -105,11 +105,10 @@ It is not a general-purpose public product.
 
 ## Honest limitations (today)
 
-Ran is young (v0.3.1). Not yet available:
+Ran is young (v0.3.2). Not yet available:
 
 - closures / lambdas (`fn(x) { ... }` as a value) — planned
 - real ownership enforcement (syntax parses but is cosmetic)
-- short-circuit `&&` / `||` (they work but always evaluate both sides)
 - channels, a package manager, and the bytecode VM (all planned)
 
 The full, accurate status is in [16 - Roadmap](16-roadmap.md).

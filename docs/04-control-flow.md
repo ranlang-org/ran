@@ -105,16 +105,18 @@ if !member {
 }
 ```
 
-> Note: `&&` and `||` are **not short-circuit**. Both sides are always evaluated, so
-> avoid relying on the left side to guard the right (for example, do not assume the
-> right side is skipped when the left is false). Nesting `if` statements still works
-> and is the way to short-circuit when you need it:
+> Note: `&&` and `||` **short-circuit**. The right side is evaluated only when it can
+> change the result — `&&` skips the right side when the left is false, and `||` skips
+> it when the left is true. This means you can safely use the left side to guard the
+> right, for example `i < n && arr[i] > 0` will not read `arr[i]` when `i < n` is false:
 
 ```ran
-if age >= 18 {
-    if member {
-        echo "access granted"
+fn first_positive(a: [int], n: int) -> int {
+    let i = 0
+    while i < n && a[i] > 0 {
+        i = i + 1
     }
+    return i
 }
 ```
 
@@ -251,8 +253,9 @@ enclosing function, not just the loop.
 
 - **Braces are mandatory.** There is no single-line `if x > 0 echo "hi"`.
 - **No parentheses on conditions.** Write `if x > 10 { }`, not `if (x > 10) { }`.
-- **`&&`, `||`, and `!` all work**, but `&&` / `||` are **not short-circuit** - both
-  sides always evaluate. Nest `if` statements when you need to guard one side.
+- **`&&`, `||`, and `!` all work**, and `&&` / `||` **short-circuit** - the right
+  side is evaluated only when it can change the result, so the left side can safely
+  guard the right (e.g. `i < n && a[i] > 0`).
 - **Comparisons work on ints, floats, and strings** (`==` / `!=` also on bools).
 - **`for` iterates arrays** - use `range(n)` to count, and `while` for custom steps.
 - **Advance your `while` counter** (e.g. `n = n - 1`) or the loop never ends.

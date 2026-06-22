@@ -53,6 +53,33 @@ the Stage A→D bootstrap fixed point that defines 1.0.0. A language fix is also
 short-circuit `&&`/`||` (currently both sides evaluate, a footgun the Ran compiler
 sources must work around).
 
+## [Unreleased]
+
+Next (self-hosting track): `bootstrap/checker.ran` → `codegen.ran` → the `ranc` CLI →
+the Stage A→D bootstrap fixed point that defines 1.0.0. Native track: HTTP client (TLS)
++ server, `concurrency`, completed-then-bridged `crypto`, `--link-static`, and making
+native the default.
+
+## [0.3.2] — Short-circuit `&&` / `||`
+
+Backward-compatible. `&&` and `||` now **short-circuit** — the right operand is
+evaluated only when needed — consistently across all three engines (interpreter, VM,
+and native). Result values are unchanged; only the conditional evaluation is new. This
+removes a long-standing footgun (e.g. `i < n && arr[i] != x` no longer reads `arr[n]`
+at the boundary) and the bootstrap compiler sources no longer need to work around it.
+Verified: 361 unit + 46 integration/golden tests green.
+
+- **Interpreter:** `&&`/`||` evaluate the left operand, then the right only if the
+  result is not already determined (using the existing truthiness rule).
+- **Native (AOT):** fixed a real bug — value-typed right operands (e.g. `a[i]`) were
+  evaluated before the C `&&`; right-operand prep is now guarded, with correct refcount
+  release. Native now short-circuits for all operand types.
+- **VM:** `&&`/`||` route to the (now-correct) interpreter; the prior VM jump-based
+  short-circuit was buggy (it dropped the operand) and is disabled pending a proper
+  peek-jump opcode.
+- Docs updated across the board (roadmap, control-flow, why-ran, syntax reference,
+  language spec) to state `&&`/`||` short-circuit.
+
 ## [0.3.1] — Self-hosting begins: a Ran parser written in Ran
 
 Milestone release: **part of the Ran compiler is now written in Ran.** Alongside the

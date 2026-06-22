@@ -44,7 +44,7 @@ does not compile to machine code or bytecode.
 - [x] Float arithmetic `+ - * /` and all float comparisons; mixed int/float arithmetic
   (int promoted to float)
 - [x] Comparisons on ints, floats, and strings (lexicographic); `==` / `!=` on bools
-- [x] Logical `!`, `&&`, and `||` (operate on truthiness; not short-circuit)
+- [x] Logical `!`, `&&`, and `||` (operate on truthiness; `&&` / `||` short-circuit)
 - [x] String concatenation with `+` (including str+int / int+str)
 - [x] String interpolation of plain variable names: `$name`, `${name}`
 - [x] Arrays and maps, with index access `array[int]` / `map["key"]`
@@ -124,7 +124,8 @@ Each stdlib module must be imported with a mandatory alias before use
 - `html.render` only performs `$var` interpolation; it is not a full template engine.
 - `ran repl` does not persist variables or functions between lines.
 
-> `&&` / `||` work but are not short-circuit (both sides always evaluate).
+> `&&` / `||` short-circuit: the right side is evaluated only when it can change the
+> result, so the left side can guard the right (e.g. `i < n && a[i] > 0`).
 
 ---
 
@@ -162,7 +163,6 @@ Each stdlib module must be imported with a mandatory alias before use
 - closures / lambdas (not parsed)
 - channels (`chan`, `<-`)
 - real ownership / borrow enforcement
-- short-circuit evaluation for `&&` / `||` (they currently evaluate both sides)
 - remote packages (paths with `/` print "remote packages not yet supported")
 - reading `ran.toml` (it is scaffolding only; nothing parses it yet)
 - wiring the bytecode VM as the engine

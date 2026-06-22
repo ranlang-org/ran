@@ -959,29 +959,28 @@ impl BytecodeCompiler {
         op: &BinaryOperator,
         right: &Expression,
     ) {
-        // Short-circuit for And/Or
-        match op {
-            BinaryOperator::And => {
-                self.compile_expression(left);
-                let jump = self.emit_jump(OpCode::JmpFalse);
-                // If left is true, evaluate right
-                let line = self.line;
-                self.chunk().emit(OpCode::Pop, line);
-                self.compile_expression(right);
-                self.patch_jump_here(jump);
-                return;
-            }
-            BinaryOperator::Or => {
-                self.compile_expression(left);
-                let jump = self.emit_jump(OpCode::JmpTrue);
-                // If left is false, evaluate right
-                let line = self.line;
-                self.chunk().emit(OpCode::Pop, line);
-                self.compile_expression(right);
-                self.patch_jump_here(jump);
-                return;
-            }
-            _ => {}
+        // `&&` / `||`: fall back to the tree-walking interpreter.
+        //
+        // The interpreter short-circuits `&&`/`||` correctly (it special-cases
+        // And/Or in `eval_expression` and evaluates the right operand only when
+        // its value can change the result — see `runtime::Environment::
+        // eval_expression`). The native AOT path short-circuits via C `&&`/`||`.
+        // The VM does NOT yet have a correct short-circuit primitive: a prior
+        // attempt compiled `&&`/`||` to JmpFalse/JmpTrue + Pop, but those jump
+        // opcodes POP their operand (if/while depend on that), so the
+        // short-circuited operand value was lost and the result was wrong (e.g.
+        // `false && a[99] > 0` evaluated truthy). A correct VM short-circuit
+        // needs a dedicated peek-style jump opcode; that is out of scope here.
+        //
+        // So we emit an intentionally-unsupported marker: the `all_supported()`
+        // pre-flight then routes the whole program to the interpreter, which
+        // executes `&&`/`||` correctly. This keeps all three engines consistent
+        // (right side evaluated only when needed) without risking the VM. The
+        // `And`/`Or` opcodes stay out of `OpCode::supported()` precisely so they
+        // can serve as these fall-back sentinels (see `emit_fallback_marker`).
+        if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+            self.emit_fallback_marker();
+            return;
         }
 
         self.compile_expression(left);

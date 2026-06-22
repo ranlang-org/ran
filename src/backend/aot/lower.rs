@@ -1260,20 +1260,62 @@ impl<'a> Emit<'a> {
         let rt = self.infer(right)?;
         let value_operand = lt == CType::Value || rt == CType::Value;
 
-        // Logical operators -> bool.
+        // Logical operators -> bool, with SHORT-CIRCUIT evaluation matching the
+        // interpreter and ordinary language semantics: the right operand (and
+        // any side effects / faults it would produce, e.g. a bounds-checked
+        // index) is evaluated ONLY when the left operand does not already decide
+        // the result. C's `&&`/`||` short-circuit the *expression*, but the
+        // backend emits operand prep as statements that run unconditionally, so
+        // relying on C operators alone would still eagerly evaluate the right
+        // side (e.g. `false && a[99]` would fault E1012). We therefore guard the
+        // right operand in an `if`.
+        //
+        // Refcount discipline: the right operand's owned `RanValue` temporaries
+        // (`_t..`) are created AND released INSIDE the guard block, then the temp
+        // counter is rewound so the enclosing statement's cleanup never touches
+        // them (they are out of C scope). The boolean result lives in an `_s`
+        // temp, which statement cleanup (which only releases `_t..`) ignores.
         if matches!(op, And | Or) {
-            let connector = if matches!(op, And) { "&&" } else { "||" };
-            if value_operand {
+            let is_and = matches!(op, And);
+
+            // Left is ALWAYS evaluated; compute its truthiness as a C condition.
+            let lcond = if lt == CType::Value {
                 let lv = self.emit_value(left, depth)?;
-                let rv = self.emit_value(right, depth)?;
-                return Ok((
-                    format!("(ran_truthy({}) {} ran_truthy({}))", lv, connector, rv),
-                    CType::Bool,
-                ));
-            }
-            let (lv, _) = self.emit_scalar(left, depth)?;
-            let (rv, _) = self.emit_scalar(right, depth)?;
-            return Ok((format!("({} {} {})", lv, connector, rv), CType::Bool));
+                format!("ran_truthy({})", lv)
+            } else {
+                self.emit_scalar(left, depth)?.0
+            };
+
+            // Result bool, seeded with the short-circuit outcome:
+            //   And: left falsy  -> false (skip right)
+            //   Or : left truthy -> true  (skip right)
+            let res = self.fresh_s();
+            self.line(
+                depth,
+                &format!("bool {} = {};", res, if is_and { "false" } else { "true" }),
+            );
+
+            // Guard: And evaluates right when left is truthy; Or when falsy.
+            let guard = if is_and { lcond } else { format!("!({})", lcond) };
+            self.line(depth, &format!("if ({}) {{", guard));
+
+            // Right operand temps are created (and released) inside this block.
+            let rstart = self.tmp;
+            let rcond = if rt == CType::Value {
+                let rv = self.emit_value(right, depth + 1)?;
+                format!("ran_truthy({})", rv)
+            } else {
+                self.emit_scalar(right, depth + 1)?.0
+            };
+            self.line(depth + 1, &format!("{} = {};", res, rcond));
+            // Release the right operand's owned temporaries here, while they are
+            // still in C scope, then rewind the counter so statement cleanup
+            // does not double-release (and the names can be safely reused).
+            self.release_range(depth + 1, rstart, self.tmp);
+            self.tmp = rstart;
+            self.line(depth, "}");
+
+            return Ok((res, CType::Bool));
         }
 
         // Comparisons -> bool.
@@ -2585,5 +2627,52 @@ fn main() {
         let checked = check(src);
         let err = supported(&checked, "test.ran").expect_err("http is not bridged");
         assert_eq!(err.code.as_deref(), Some("E0606"));
+    }
+
+    // ---- Short-circuit `&&` / `||` lowering --------------------------------
+    //
+    // The right operand of `&&`/`||` must be evaluated ONLY when the left does
+    // not already decide the result. Because operand prep is emitted as
+    // statements (a bounds-checked index would run unconditionally otherwise),
+    // the lowered C must guard the right operand in an `if`, not rely on C's
+    // `&&`/`||` alone. Here `a[99]` is a value-typed (bounds-checked) right
+    // operand, the case that previously faulted because it was emitted eagerly.
+
+    #[test]
+    fn lower_and_short_circuits_value_right_operand() {
+        let src = r#"
+fn main() {
+    let a = [1, 2, 3]
+    if false && a[99] > 0 { echo "x" } else { echo "ok" }
+}
+"#;
+        let checked = check(src);
+        assert!(supported(&checked, "test.ran").is_ok());
+        let c = lower(&checked, "test.ran").unwrap();
+        // The result bool is seeded false (And short-circuit value) and the
+        // right operand is computed inside a guard block, so the bounds-checked
+        // index is NOT emitted unconditionally.
+        assert!(c.contains("bool _s"), "short-circuit result temp:\n{c}");
+        assert!(c.contains("if ("), "right operand must be guarded:\n{c}");
+        // The bounds-checked index helper appears INSIDE the guard, after an
+        // `if (`, never as an unconditional top-level statement before it.
+        let idx_pos = c.find("ran_index(").expect("index helper present");
+        let guard_pos = c.find("if (").expect("guard present");
+        assert!(guard_pos < idx_pos, "index must be emitted inside the guard:\n{c}");
+    }
+
+    #[test]
+    fn lower_or_short_circuits_seeds_true() {
+        let src = r#"
+fn main() {
+    if true || (1 / 0) > 0 { echo "ok" }
+}
+"#;
+        let checked = check(src);
+        assert!(supported(&checked, "test.ran").is_ok());
+        let c = lower(&checked, "test.ran").unwrap();
+        // Or seeds the result true (skip-right outcome) and guards the right.
+        assert!(c.contains("bool _s"), "short-circuit result temp:\n{c}");
+        assert!(c.contains("= true;"), "Or seeds true:\n{c}");
     }
 }

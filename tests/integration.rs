@@ -476,3 +476,133 @@ fn main() {
     assert!(s.contains("\\n"), "expected escaped newline in: {}", s);
     assert!(s.contains("roundtrip-valid"));
 }
+
+// ===========================================================================
+// Short-circuit `&&` / `||` (R: queued language fix). The interpreter now
+// evaluates the right operand of `&&`/`||` ONLY when its value can change the
+// result, matching the native AOT path (C `&&`/`||`). These end-to-end tests
+// run via the `ran` binary on BOTH the default engine and the forced
+// interpreter (`--interp`) so the two paths stay in lockstep.
+// ===========================================================================
+
+/// Like `run`, but passes extra CLI flags (e.g. `--interp`) before the file.
+fn run_with_flags(src: &str, flags: &[&str]) -> Output {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("ran_it_{}.ran", nonce()));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ran"));
+    for flag in flags {
+        cmd.arg(flag);
+    }
+    let out = cmd.arg(&path).output().expect("failed to run ran");
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+#[test]
+fn and_short_circuits_skips_out_of_bounds_index() {
+    // `false && a[99] > 0` must NOT touch a[99] (no E1012); prints "ok".
+    let src = r#"
+fn main() {
+    let a = [1, 2, 3]
+    if false && a[99] > 0 { echo "x" } else { echo "ok" }
+}
+"#;
+    for flags in [&[][..], &["--interp"][..]] {
+        let out = run_with_flags(src, flags);
+        assert_eq!(code(&out), 0, "flags={:?} stderr: {}", flags, stderr(&out));
+        assert!(!stderr(&out).contains("E1012"), "flags={:?} unexpected bounds fault: {}", flags, stderr(&out));
+        assert_eq!(stdout(&out).trim(), "ok", "flags={:?}", flags);
+    }
+}
+
+#[test]
+fn or_short_circuits_skips_div_by_zero() {
+    // `true || (1/0) > 0` must NOT evaluate 1/0 (no E1011); prints "ok".
+    let src = r#"
+fn main() {
+    if true || (1 / 0) > 0 { echo "ok" }
+}
+"#;
+    for flags in [&[][..], &["--interp"][..]] {
+        let out = run_with_flags(src, flags);
+        assert_eq!(code(&out), 0, "flags={:?} stderr: {}", flags, stderr(&out));
+        assert!(!stderr(&out).contains("E1011"), "flags={:?} unexpected div-by-zero fault: {}", flags, stderr(&out));
+        assert_eq!(stdout(&out).trim(), "ok", "flags={:?}", flags);
+    }
+}
+
+#[test]
+fn and_bounds_guard_loop_does_not_fault_at_boundary() {
+    // The classic guard pattern `i < n && a[i] > 0`: when i reaches n the right
+    // side must be skipped, so a[n] is never read out of bounds.
+    let src = r#"
+fn main() {
+    let a = [5, 4, 3]
+    let n = 3
+    let i = 0
+    let count = 0
+    while i < n && a[i] > 0 {
+        count = count + 1
+        i = i + 1
+    }
+    echo count
+}
+"#;
+    for flags in [&[][..], &["--interp"][..]] {
+        let out = run_with_flags(src, flags);
+        assert_eq!(code(&out), 0, "flags={:?} stderr: {}", flags, stderr(&out));
+        assert!(!stderr(&out).contains("E1012"), "flags={:?} boundary fault: {}", flags, stderr(&out));
+        assert_eq!(stdout(&out).trim(), "3", "flags={:?}", flags);
+    }
+}
+
+#[test]
+fn and_short_circuit_skips_right_side_effects() {
+    // The right operand's observable side effects (a `&mut` increment) must NOT
+    // happen when the left side already decides the result.
+    let src = r#"
+fn bump(c: &mut int) -> bool {
+    c = c + 1
+    return true
+}
+fn main() {
+    let calls = 0
+    if false && bump(&mut calls) { echo "x" }
+    echo calls
+}
+"#;
+    for flags in [&[][..], &["--interp"][..]] {
+        let out = run_with_flags(src, flags);
+        assert_eq!(code(&out), 0, "flags={:?} stderr: {}", flags, stderr(&out));
+        // calls stays 0 because bump() was short-circuited away.
+        assert_eq!(stdout(&out).trim(), "0", "flags={:?}", flags);
+    }
+}
+
+#[test]
+fn or_short_circuit_skips_right_side_effects() {
+    // Mirror of the `&&` case for `||`: a truthy left skips the right call.
+    let src = r#"
+fn bump(c: &mut int) -> bool {
+    c = c + 1
+    return true
+}
+fn main() {
+    let calls = 0
+    if true || bump(&mut calls) { echo "ok" }
+    echo calls
+}
+"#;
+    for flags in [&[][..], &["--interp"][..]] {
+        let out = run_with_flags(src, flags);
+        assert_eq!(code(&out), 0, "flags={:?} stderr: {}", flags, stderr(&out));
+        let s = stdout(&out);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "ok", "flags={:?}", flags);
+        assert_eq!(lines[1], "0", "flags={:?}", flags);
+    }
+}

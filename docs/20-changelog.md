@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — Short-circuit `&&` / `||`
+
+Backward-compatible. `&&` and `||` now **short-circuit** (right operand evaluated only
+when needed) consistently across the interpreter, VM, and native engines. Result values
+unchanged; only conditional evaluation is new — removes a footgun (`i < n && arr[i]`
+no longer reads `arr[n]` at the boundary). Verified: 361 unit + 46 integration green.
+Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
 ## 0.3.1 — Self-hosting begins: a Ran parser written in Ran
 
 Milestone: **part of the Ran compiler is now written in Ran.** Alongside the existing

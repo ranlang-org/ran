@@ -189,7 +189,8 @@ Work on integers, floats, and strings (strings compare lexicographically). `==` 
 ### Logical
 ```
 !        logical not
-&&  ||   logical and / or (operate on truthiness; NOT short-circuit - both sides evaluate)
+&&  ||   logical and / or (operate on truthiness; short-circuit - the right side is
+         evaluated only when it can change the result)
 ```
 
 ### Assignment

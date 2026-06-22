@@ -1,6 +1,6 @@
 # Roadmap & Feature Status
 
-This page is the honest, single-source status list for Ran v0.3.1. It separates what
+This page is the honest, single-source status list for Ran v0.3.2. It separates what
 works today from what is partial and what is planned. When a doc elsewhere says "Status
 note", this is the page it points back to.
 
@@ -38,8 +38,8 @@ These features work and are safe to rely on today.
 - **Operators:** integer `+ - * / %`; float `+ - * /`; mixed int/float arithmetic
   (int promoted to float); all comparisons (`< <= > >= == !=`) on ints, floats, and
   strings (lexicographic), plus `==` / `!=` on bools; string concatenation with `+`
-  (including str+int / int+str); logical `!`, `&&`, and `||` (not short-circuit - both
-  sides evaluate).
+  (including str+int / int+str); logical `!`, `&&`, and `||` (`&&` / `||`
+  short-circuit - the right side is evaluated only when it can change the result).
 - **Structs, enums, methods & traits:** `struct` definitions, struct-literal
   expressions, field access, `impl` methods (`self`) and associated functions /
   constructors, `enum` declarations, `match` (literal / variant / binding / wildcard
@@ -106,8 +106,6 @@ These work, but with real limitations. Don't assume full behavior.
 - **`html.render`** only does `$var` interpolation; it is not a full template engine,
   and it does not auto-escape values.
 - **REPL** does not persist variables or functions between lines.
-- **Short-circuit `&&` / `||`.** They evaluate correctly but always evaluate both
-  sides (no short-circuiting).
 - **Deref-assignment (`*p = ...`)** is not parsed yet (`E0102`). Update a value by
   returning it and rebinding, or pass a `&mut` parameter (which writes back).
 

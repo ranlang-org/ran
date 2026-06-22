@@ -1342,6 +1342,32 @@ impl Environment {
             Expression::Variable(name) => self.var_get(name).unwrap_or(Value::Void),
 
             Expression::BinaryOp { left, op, right } => {
+                // R: `&&` and `||` short-circuit, matching the native AOT path
+                // (C `&&`/`||`) and ordinary language expectations. The right
+                // operand is evaluated ONLY when its value can change the result,
+                // so `false && arr[i]` never touches `arr[i]` (no spurious
+                // E1011/E1012) and side effects on the right side are skipped.
+                // Result semantics are unchanged: we still yield `Bool` of the
+                // combined truthiness.
+                match op {
+                    BinaryOperator::And => {
+                        let l = self.eval_expression(left);
+                        if !l.is_truthy_val() {
+                            return Value::Bool(false);
+                        }
+                        let r = self.eval_expression(right);
+                        return Value::Bool(r.is_truthy_val());
+                    }
+                    BinaryOperator::Or => {
+                        let l = self.eval_expression(left);
+                        if l.is_truthy_val() {
+                            return Value::Bool(true);
+                        }
+                        let r = self.eval_expression(right);
+                        return Value::Bool(r.is_truthy_val());
+                    }
+                    _ => {}
+                }
                 let l = self.eval_expression(left);
                 let r = self.eval_expression(right);
                 self.eval_binary_op(&l, op, &r)
@@ -2205,6 +2231,140 @@ mod tests {
         assert!(matches!(and, Value::Bool(false)));
         let or = e.eval_binary_op(&Value::Bool(false), &BinaryOperator::Or, &Value::Bool(true));
         assert!(matches!(or, Value::Bool(true)));
+    }
+
+    // --- Short-circuit `&&` / `||` (interpreter expression path) ----------
+    //
+    // The expression path special-cases `And`/`Or` so the right operand is
+    // evaluated ONLY when its value can affect the result, matching the native
+    // AOT path (C `&&`/`||`). These tests prove the right side is NOT evaluated
+    // when the left side already decides the outcome — using a div-by-zero
+    // right operand that would raise `E1011` if (and only if) it ran.
+
+    fn lit(n: i64) -> Box<Expression> {
+        Box::new(Expression::IntLiteral(n))
+    }
+
+    /// `1 / 0 > 0` — an expression that faults with E1011 the instant it is
+    /// evaluated. Used as a "tripwire" right operand for short-circuit tests.
+    fn faulting_expr() -> Box<Expression> {
+        Box::new(Expression::BinaryOp {
+            left: Box::new(Expression::BinaryOp {
+                left: lit(1),
+                op: BinaryOperator::Div,
+                right: lit(0),
+            }),
+            op: BinaryOperator::Gt,
+            right: lit(0),
+        })
+    }
+
+    fn boolean(b: bool) -> Box<Expression> {
+        Box::new(Expression::BoolLiteral(b))
+    }
+
+    #[test]
+    fn and_short_circuits_falsy_left_skips_faulting_right() {
+        // `false && (1/0 > 0)` must return Bool(false) WITHOUT evaluating the
+        // right operand (no E1011 fault).
+        let expr = Expression::BinaryOp {
+            left: boolean(false),
+            op: BinaryOperator::And,
+            right: faulting_expr(),
+        };
+        let result = catch_fault(|| {
+            let mut e = env();
+            e.eval_expression(&expr)
+        });
+        match result {
+            Ok(Value::Bool(false)) => {}
+            other => panic!("expected Ok(Bool(false)) with no fault, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn or_short_circuits_truthy_left_skips_faulting_right() {
+        // `true || (1/0 > 0)` must return Bool(true) WITHOUT evaluating the
+        // right operand (no E1011 fault).
+        let expr = Expression::BinaryOp {
+            left: boolean(true),
+            op: BinaryOperator::Or,
+            right: faulting_expr(),
+        };
+        let result = catch_fault(|| {
+            let mut e = env();
+            e.eval_expression(&expr)
+        });
+        match result {
+            Ok(Value::Bool(true)) => {}
+            other => panic!("expected Ok(Bool(true)) with no fault, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn and_evaluates_right_when_left_truthy() {
+        // `true && (1/0 > 0)` MUST evaluate the right operand, so the E1011
+        // fault is raised. This proves we don't over-eagerly short-circuit.
+        let expr = Expression::BinaryOp {
+            left: boolean(true),
+            op: BinaryOperator::And,
+            right: faulting_expr(),
+        };
+        let result = catch_fault(|| {
+            let mut e = env();
+            e.eval_expression(&expr)
+        });
+        match result {
+            Err(f) => assert_eq!(f.code, "E1011"),
+            Ok(v) => panic!("expected E1011 fault, got Ok({:?})", v),
+        }
+    }
+
+    #[test]
+    fn or_evaluates_right_when_left_falsy() {
+        // `false || (1/0 > 0)` MUST evaluate the right operand (E1011 fault).
+        let expr = Expression::BinaryOp {
+            left: boolean(false),
+            op: BinaryOperator::Or,
+            right: faulting_expr(),
+        };
+        let result = catch_fault(|| {
+            let mut e = env();
+            e.eval_expression(&expr)
+        });
+        match result {
+            Err(f) => assert_eq!(f.code, "E1011"),
+            Ok(v) => panic!("expected E1011 fault, got Ok({:?})", v),
+        }
+    }
+
+    #[test]
+    fn and_or_result_values_preserved() {
+        // Result semantics are unchanged: `&&`/`||` still yield Bool of the
+        // combined truthiness for the non-short-circuited cases.
+        let mut e = env();
+        // true && true -> true
+        let tt = e.eval_expression(&Expression::BinaryOp {
+            left: boolean(true),
+            op: BinaryOperator::And,
+            right: boolean(true),
+        });
+        assert!(matches!(tt, Value::Bool(true)));
+        // false || false -> false
+        let ff = e.eval_expression(&Expression::BinaryOp {
+            left: boolean(false),
+            op: BinaryOperator::Or,
+            right: boolean(false),
+        });
+        assert!(matches!(ff, Value::Bool(false)));
+        // Non-bool truthiness: 0 is falsy, so `0 && <faulting>` short-circuits
+        // to false and a non-zero int on the left of `||` short-circuits true.
+        let zero_and = e.eval_expression(&Expression::BinaryOp {
+            left: lit(0),
+            op: BinaryOperator::And,
+            right: boolean(true),
+        });
+        assert!(matches!(zero_and, Value::Bool(false)));
     }
 
     // --- &mut write-back to the caller (R11.6, task 8.2) ------------------

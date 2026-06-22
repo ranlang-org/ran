@@ -21,7 +21,7 @@ ran build hello.ran -o hello
 ./hello
 ```
 
-> Status: v0.3.1, under active development. This README and `docs/` describe what
+> Status: v0.3.2, under active development. This README and `docs/` describe what
 > works today; partial or planned features are labelled. See `docs/16-roadmap.md`.
 
 ---
@@ -173,7 +173,7 @@ support.
 
 Partial / planned: **native AOT machine-code generation** (`ran build` still embeds the
 interpreter today — a true native backend is designed; see `docs/16-roadmap.md`),
-short-circuit `&&`/`||`, deref-assignment (`*p = ...`), inbound server TLS, a CSPRNG and
+deref-assignment (`*p = ...`), inbound server TLS, a CSPRNG and
 password-hashing KDF, a package manager, and the Ran-in-Ran compiler + bootstrap. See
 `docs/16-roadmap.md`.
 

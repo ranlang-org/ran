@@ -15,12 +15,12 @@
 # a single `ranc` CLI as proper modules is a later task (15.4); until then this
 # file is self-contained so `ran bootstrap/parser.ran` just works.
 #
-# NOTE on `&&`/`||`: in the current language they are NOT short-circuit (both
-# sides always evaluate, see docs/25-language-spec.md §2). With checked indexing
-# (E1012) that means `while i < n && f(arr[i])` would read `arr[n]` out of
-# bounds. So every scan loop here guards the bounds with a nested `if` instead,
-# and the token cursor is read through an EOF-safe `at()` that returns an `eof`
-# sentinel past the end.
+# NOTE on `&&`/`||`: these short-circuit — the right side is evaluated only when
+# it can change the result (see docs/25-language-spec.md §2), so a guard like
+# `while i < n && f(arr[i])` will NOT read `arr[n]` when `i < n` is false. The
+# nested-`if` bounds guards and the EOF-safe `at()` cursor below predate that
+# fix; they remain because they are still correct and clear, but new code can
+# now rely on `&&`/`||` short-circuiting directly.
 #
 # NOTE on borrowing: passing a bare variable by value moves it (E0210 under
 # strict), even a scalar `int`. So every argument that is a plain variable is

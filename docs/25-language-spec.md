@@ -5,7 +5,7 @@ exists so a **second, self-hosted implementation** (`bootstrap/`) can be written
 to match the stage-0 (host) implementation exactly. It describes only what is
 implemented; planned features are listed at the end.
 
-Status: draft for v0.3.1. Where the prose and the implementation disagree, the
+Status: draft for v0.3.2. Where the prose and the implementation disagree, the
 implementation (and its test suite) is authoritative until this document is
 corrected.
 
@@ -95,8 +95,10 @@ pattern     = literal | ident "." ident | ident | "_" ;
 type        = ident | "&" type | "&mut" type | "[" type "]" ;
 ```
 
-Notes: `&&`/`||` are **not** short-circuit (both sides evaluate). A single
-expression must fit on one line (no implicit line continuation).
+Notes: `&&`/`||` **short-circuit** — the right operand is evaluated only when it
+can change the result (`&&` skips the right side when the left is falsy; `||`
+skips it when the left is truthy). A single expression must fit on one line (no
+implicit line continuation).
 
 ---
 
@@ -209,7 +211,7 @@ logging, JSON, fs, os, time, math, str, rand, html.
 ## 12. Not yet specified / implemented
 
 Closures, `break`/`continue`, `match`-arm `return` propagation, traits,
-short-circuit `&&`/`||`, deref-assignment, a `Result`-threaded error model,
+deref-assignment, a `Result`-threaded error model,
 inbound server TLS, a package manager, and native code generation. These are on
 the bootstrap roadmap (`TODO.md`); the self-hosted compiler targets the stable
 subset above first.
