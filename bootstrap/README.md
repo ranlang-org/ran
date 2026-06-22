@@ -13,8 +13,8 @@ incrementally toward self-hosting. It runs on the current `ran` interpreter
 |------|-------|--------|
 | `lexer.ran` | B1 — source → tokens | ✅ runs on the interpreter; passes `--ownership=strict` |
 | `parser.ran` | B2 — tokens → AST | ✅ runs on the interpreter & VM; passes `--ownership=strict` |
-| `checker.ran` | B3 — analysis + ownership | ⬜ next |
-| `codegen.ran` | B4 — AST → bytecode/native | ⬜ |
+| `checker.ran` | B3 — analysis + ownership | ✅ runs on the interpreter & VM; passes `--ownership=strict`; reports E0001/E0002/E0003/E0008 (+ E0100 syntax) over the AST |
+| `codegen.ran` | B4 — AST → bytecode/native | ⬜ next |
 
 Run the lexer proof-of-concept:
 
@@ -40,11 +40,46 @@ statements; and the full expression precedence ladder `|| && == != < <= > >=
 AST of tagged maps and reports syntax errors as `Error` nodes (carrying an
 `E####` code, message, and the offending token) instead of crashing the host.
 
-> The lexer is **duplicated** inside `parser.ran` on purpose: each bootstrap
-> file has exactly one `fn main()`, so `import "./lexer"` would merge two
-> `main`s (an `E0008` duplicate definition). Wiring the stages together as real
-> modules is task 15.4 (`ranc.ran`); until then each file stays self-contained
-> and runnable on its own.
+Run the checker proof-of-concept:
+
+```fish
+ran bootstrap/checker.ran
+# lexes + parses several sample programs and runs the semantic analysis pass,
+# printing host-style diagnostics (or "ok (no errors)") for each. Output is
+# identical on the VM (default), the interpreter (`--interp`), and under
+# `--ownership=strict`.
+```
+
+`checker.ran` is a semantic analyzer over the parser's AST, mirroring the host
+analyzer (`../src/semantics/analyzer.rs`). It collects top-level function
+declarations (name + arity) and reports, collecting **all** diagnostics at once:
+
+- **E0100** — syntax errors (any `Error` node the parser produced), surfaced first.
+- **E0008** — duplicate definition (a function declared more than once).
+- **E0002** — undefined function (a `Call` to a name that is neither a declared
+  function, a built-in, nor an in-scope variable). The built-in set matches the
+  interpreter's (`echo`, `print`, `println`, `len`, `typeof`, `str`, `int`,
+  `float`, `push`, `map`, `set`, `get`, `exit`, `range`, `keys`, `values`,
+  `abs`, `assert`, `bool`, `dec`).
+- **E0003** — wrong argument count for a call to a known user function.
+- **E0001** — undefined variable (a referenced `Ident` not in scope). Scope is
+  lexical: function params + `let` bindings, with `if`/`while` bodies getting
+  their own block scope (bindings do not leak out). Function bodies see globals
+  plus their own params. Assignment follows the interpreter's `var_set`
+  (`../src/runtime/frame.rs`): assigning to an unknown name **defines** it
+  (define-on-assign), so an `Assign` target never raises E0001.
+
+Diagnostics are printed in the project's `error[E####]: message` + `= help:`
+style. AST nodes do not carry line/col yet, so each diagnostic names the
+offending identifier; precise `file:line:col` spans arrive once the parser
+threads token positions (a later task).
+
+> The lexer is **duplicated** inside `parser.ran` on purpose, and both the lexer
+> and parser are **duplicated** inside `checker.ran` on purpose: each bootstrap
+> file has exactly one `fn main()`, so `import "./lexer"` / `import "./parser"`
+> would merge multiple `main`s (an `E0008` duplicate definition). Wiring the
+> stages together as real modules is task 15.4 (`ranc.ran`); until then each
+> file stays self-contained and runnable on its own.
 
 It is written in **pure Ran** (no `std::` imports) using only core features:
 `.chars()`, array indexing, `push`, and lexicographic character comparison.

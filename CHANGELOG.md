@@ -11,54 +11,33 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next: native AOT iterations D3+ (general string interpolation, closures, trait
-dispatch, then `spawn`/channels and stdlib via `libran_rt`), `--link-static`,
-making native the default once the subset matures, and Phases E–G (compiler
-stdlib, the Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that
-defines 1.0.0).
+Next (self-hosting track): `bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D
+bootstrap fixed point that defines 1.0.0. Native track: HTTP client (TLS) + server
+(after fixing the native string-refcount leak), `concurrency` (pthreads),
+completed-then-bridged `crypto`, `--link-static`, and making native the default once
+the subset matures.
 
-## [Unreleased]
+## [0.3.3] — Self-hosting: a Ran semantic checker written in Ran
 
-Next: native AOT D4b — a native map/dict value type (unlocking `json.decode`/`parse`,
-`os.meminfo`) and the heavier stdlib modules (`http`, `db`, `web`, `concurrency`,
-`crypto`, `env`); then closures/trait dispatch native, `--link-static`, and making
-native the default once the subset matures. Phases E–G (compiler stdlib, the
-Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0) follow.
+Milestone release: **the Ran compiler's semantic checker is now written in Ran.**
+Joining the Ran-written lexer (`bootstrap/lexer.ran`) and parser
+(`bootstrap/parser.ran`), a new **semantic checker in Ran** (`bootstrap/checker.ran`)
+walks the parsed AST and reports the core diagnostics — so `ranc` now spans
+lexer + parser + checker, all written in Ran and running today on the `ran` binary
+(interpreter, VM, and under `--ownership=strict`). Backward compatible.
 
-## [Unreleased]
+### Added — `bootstrap/checker.ran` (the semantic checker, in Ran)
 
-Next: native AOT D4b-2/3 — `concurrency` (`spawn`/channels via pthreads) and
-`crypto`, then the I/O-heavy `http` (server + TLS client) and `db` (SQLite) modules
-linked into native binaries; `--link-static`; making native the default once the
-subset matures. Phases E–G (compiler stdlib, the Ran-in-Ran compiler `ranc`, and
-the bootstrap fixed point that defines 1.0.0) follow.
-
-## [Unreleased]
-
-Next: native AOT — the HTTP client (TLS) and HTTP server, then `concurrency`
-(`spawn`/channels via pthreads), then completing and bridging `crypto`;
-`--link-static`; making native the default once the subset matures. (A known
-native-string refcount leak is to be fixed before the HTTP server, since a
-long-running server must not leak per request.) Phases E–G (compiler stdlib,
-the Ran-in-Ran compiler `ranc`, and the bootstrap fixed point that defines 1.0.0)
-follow.
-
-## [Unreleased]
-
-Next: native HTTP client (TLS) + HTTP server (after fixing the native string-refcount
-leak), then `concurrency` (pthreads) and a completed-then-bridged `crypto`;
-`--link-static`; making native the default. On the self-hosting track: grow the
-Ran-written compiler (`bootstrap/checker.ran` → `codegen.ran` → the `ranc` CLI) toward
-the Stage A→D bootstrap fixed point that defines 1.0.0. A language fix is also queued:
-short-circuit `&&`/`||` (currently both sides evaluate, a footgun the Ran compiler
-sources must work around).
-
-## [Unreleased]
-
-Next (self-hosting track): `bootstrap/checker.ran` → `codegen.ran` → the `ranc` CLI →
-the Stage A→D bootstrap fixed point that defines 1.0.0. Native track: HTTP client (TLS)
-+ server, `concurrency`, completed-then-bridged `crypto`, `--link-static`, and making
-native the default.
+- Pure Ran (no `std::` imports), self-contained (bundles its own lex + parse), one
+  `main`. Walks the AST and reports the core semantic diagnostics with `E####` codes:
+  - `E0001` — use of an undefined variable
+  - `E0002` — call to an undefined function
+  - `E0003` — wrong number of arguments to a call
+  - `E0008` — duplicate function definition (e.g. two `main`s)
+  - `E0100` — assignment to an immutable (`let`, not `let mut`) binding
+- Scope tracking (function parameters + `let`/`let mut`), a function signature table
+  (arity + mutability), and located diagnostics (no host crash on bad input). Runs
+  identically on the VM and the interpreter and passes `--ownership=strict`.
 
 ## [0.3.2] — Short-circuit `&&` / `||`
 

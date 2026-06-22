@@ -1,0 +1,1205 @@
+#!/usr/bin/env ran
+# bootstrap/checker.ran — a semantic CHECKER for a subset of Ran, WRITTEN IN RAN.
+#
+# Third component of the self-hosted compiler `ranc` (Phase B3 of the bootstrap
+# roadmap, after `lexer.ran` and `parser.ran`). It runs on the current `ran`
+# interpreter/VM today: Ran can already lex + parse Ran source into an AST and
+# then run the analysis pass over that AST. Like the lexer and parser it uses
+# only core language features (no `std::` import): `map()`/`set`/`get`, arrays,
+# `push`, `len`, `.chars()`, `if`/`while`, and recursion. It also passes
+# `--ownership=strict` (every reused value is borrowed with `&`, like the lexer
+# and parser; the diagnostic accumulator is threaded move-in / move-out).
+#
+# IMPORTANT — the lexer and the parser are duplicated below ON PURPOSE. Each
+# bootstrap file has exactly one `fn main()`, and `import "./parser"` /
+# `import "./lexer"` would merge multiple `main`s into one program (an E0008
+# duplicate-definition error). Wiring lexer + parser + checker into a single
+# `ranc` CLI as proper modules is a later task (15.4); until then this file is
+# self-contained so `ran bootstrap/checker.ran` just works.
+#
+# NOTE on `&&`/`||`: these short-circuit (v0.3.2) — the right side runs only
+# when it can change the result — so natural bounds-guard idioms are safe. The
+# adapted lexer below keeps the parser's nested-`if` EOF-safe form because it is
+# already correct and clear; new code may rely on short-circuiting directly.
+#
+# NOTE on borrowing: passing a bare variable by value moves it (E0210 under
+# strict), even a scalar `int`. So every argument that is a plain variable is
+# borrowed with `&`; only fresh temporaries (e.g. `pos + 1`, `len(x)`, a string
+# concatenation, or a value extracted from a map with `m["k"]`) are passed by
+# value. Built-ins (`len`, `str`, `push`, `set`, `get`, `map`) and the `+`
+# operator read their arguments without consuming them, so they take values
+# directly. The growing list of diagnostics is threaded through the analysis as
+# an accumulator: each `check_*` takes it by value and returns it.
+#
+# WHAT IT CHECKS (over the parser's AST, mirroring the host analyzer's spirit —
+# see ../src/semantics/analyzer.rs and ../docs/12-error-handling.md):
+#   E0100  syntax errors — any `Error` node the parser produced (surfaced FIRST)
+#   E0008  duplicate definition — a function name declared more than once
+#   E0002  undefined function — a `Call` to a name that is neither a declared
+#          function, a known built-in, nor an in-scope variable
+#   E0003  wrong argument count — a `Call` to a known user function with the
+#          wrong number of arguments
+#   E0001  undefined variable — a referenced `Ident` not in scope and not a
+#          function name
+#
+# SCOPE MODEL (mirrors `analyzer.rs::check_body`): lexical scope is a set of
+# names. A block (`if`/`while` body, a function body) starts from a COPY of its
+# parent scope, so a binding made inside a block does NOT leak out. A function
+# body sees the program's globals plus its own parameters (not another
+# function's locals). Function names are collected first (so calls may appear
+# before the definition); top-level `let`/assignment bindings are collected into
+# the global scope. ASSIGNMENT semantics follow the interpreter's `var_set`
+# (../src/runtime/frame.rs): assigning to an unknown name DEFINES it
+# (define-on-assign) rather than being an error — so `Assign` never raises E0001
+# for its target; its value expression is still checked.
+#
+# POSITIONS: parser AST nodes do not carry line/col yet, so diagnostics identify
+# the offending name (in backticks) instead of a `file:line:col` span. Precise
+# spans arrive once the parser threads token positions (a later task); the
+# checker is structured so adding them is a localized change.
+#
+# Output: for each sample program, the diagnostics in the host's
+# `error[E####]: message` + `= help:` style (all of them, not just the first),
+# a `aborting due to N errors emitted` summary, or a clean `ok (no errors)`.
+# Deterministic, readable golden.
+
+# ===========================================================================
+# SECTION 1 — Lexer (adapted copy of bootstrap/lexer.ran; EOF-safe scan loops)
+# ===========================================================================
+
+fn is_digit(c) {
+    if c >= "0" { if c <= "9" { return true } }
+    return false
+}
+
+fn is_alpha(c) {
+    if c >= "a" { if c <= "z" { return true } }
+    if c >= "A" { if c <= "Z" { return true } }
+    if c == "_" { return true }
+    return false
+}
+
+fn is_alnum(c) {
+    if is_digit(&c) { return true }
+    if is_alpha(&c) { return true }
+    return false
+}
+
+fn is_space(c) {
+    if c == " " { return true }
+    if c == "\t" { return true }
+    if c == "\n" { return true }
+    if c == "\r" { return true }
+    return false
+}
+
+fn is_keyword(w) {
+    let kws = ["fn", "let", "mut", "if", "else", "return", "while", "for",
+               "in", "import", "as", "struct", "enum", "match", "impl",
+               "spawn", "true", "false"]
+    for k in kws {
+        if k == w { return true }
+    }
+    return false
+}
+
+fn two_char_op(s) {
+    let ops = ["==", "!=", "<=", ">=", "&&", "||", "->", "=>", "::"]
+    for o in ops {
+        if o == s { return true }
+    }
+    return false
+}
+
+fn tok(kind, text) {
+    let m = map()
+    set(m, "kind", kind)
+    set(m, "text", text)
+    return m
+}
+
+# source string -> array of {kind, text} tokens
+fn lex(src) {
+    let chars = src.chars()
+    let n = len(chars)
+    let mut tokens = []
+    let mut i = 0
+
+    while i < n {
+        if is_space(&chars[i]) {
+            i = i + 1
+        } else {
+            let mut handled = false
+
+            # line comment: `#...` or `//...` to end of line
+            let mut slashslash = false
+            if chars[i] == "/" {
+                if i + 1 < n {
+                    if chars[i + 1] == "/" { slashslash = true }
+                }
+            }
+            if chars[i] == "#" { slashslash = true }
+            if slashslash {
+                let mut go = true
+                while go {
+                    if i >= n { go = false } else {
+                        if chars[i] == "\n" { go = false } else { i = i + 1 }
+                    }
+                }
+                handled = true
+            }
+
+            # string literal: "..."
+            if !handled {
+                if chars[i] == "\"" {
+                    let mut s = ""
+                    i = i + 1
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if chars[i] == "\"" { go = false } else {
+                                s = s + chars[i]
+                                i = i + 1
+                            }
+                        }
+                    }
+                    i = i + 1
+                    push(tokens, tok("str", s))
+                    handled = true
+                }
+            }
+
+            # number
+            if !handled {
+                if is_digit(&chars[i]) {
+                    let mut num = ""
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if is_digit(&chars[i]) {
+                                num = num + chars[i]
+                                i = i + 1
+                            } else { go = false }
+                        }
+                    }
+                    push(tokens, tok("num", num))
+                    handled = true
+                }
+            }
+
+            # identifier or keyword
+            if !handled {
+                if is_alpha(&chars[i]) {
+                    let mut word = ""
+                    let mut go = true
+                    while go {
+                        if i >= n { go = false } else {
+                            if is_alnum(&chars[i]) {
+                                word = word + chars[i]
+                                i = i + 1
+                            } else { go = false }
+                        }
+                    }
+                    let mut kind = "ident"
+                    if is_keyword(&word) { kind = "keyword" }
+                    push(tokens, tok(kind, word))
+                    handled = true
+                }
+            }
+
+            # two-char operator
+            if !handled {
+                if i + 1 < n {
+                    let pair = chars[i] + chars[i + 1]
+                    if two_char_op(&pair) {
+                        push(tokens, tok("op", pair))
+                        i = i + 2
+                        handled = true
+                    }
+                }
+            }
+
+            # single-char operator / punctuation
+            if !handled {
+                push(tokens, tok("op", chars[i]))
+                i = i + 1
+            }
+        }
+    }
+
+    return tokens
+}
+
+# ===========================================================================
+# SECTION 2 — Token cursor helpers (EOF-safe; never index out of bounds)
+# ===========================================================================
+
+fn at(toks, pos) {
+    if pos < len(toks) {
+        return toks[pos]
+    }
+    return tok("eof", "")
+}
+
+fn kind_at(toks, pos) {
+    let t = at(&toks, &pos)
+    return t["kind"]
+}
+
+fn text_at(toks, pos) {
+    let t = at(&toks, &pos)
+    return t["text"]
+}
+
+fn is_op(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "op" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+fn is_kw(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "keyword" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+fn is_ident_text(toks, pos, s) {
+    let t = at(&toks, &pos)
+    if t["kind"] == "ident" {
+        if t["text"] == s { return true }
+    }
+    return false
+}
+
+# ===========================================================================
+# SECTION 3 — AST + result constructors (identical node shape to parser.ran)
+# ===========================================================================
+
+fn res(node, pos) {
+    let r = map()
+    set(r, "node", node)
+    set(r, "pos", pos)
+    return r
+}
+
+fn rnode(r) { return r["node"] }
+fn rpos(r) { return r["pos"] }
+
+fn nd_int(v) {
+    let m = map()
+    set(m, "node", "Int")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_str(v) {
+    let m = map()
+    set(m, "node", "Str")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_bool(v) {
+    let m = map()
+    set(m, "node", "Bool")
+    set(m, "value", v)
+    return m
+}
+
+fn nd_ident(name) {
+    let m = map()
+    set(m, "node", "Ident")
+    set(m, "name", name)
+    return m
+}
+
+fn nd_binary(op, left, right) {
+    let m = map()
+    set(m, "node", "Binary")
+    set(m, "op", op)
+    set(m, "left", left)
+    set(m, "right", right)
+    return m
+}
+
+fn nd_unary(op, operand) {
+    let m = map()
+    set(m, "node", "Unary")
+    set(m, "op", op)
+    set(m, "operand", operand)
+    return m
+}
+
+fn nd_call(callee, args) {
+    let m = map()
+    set(m, "node", "Call")
+    set(m, "callee", callee)
+    set(m, "args", args)
+    return m
+}
+
+fn nd_error(msg, toks, pos) {
+    let t = at(&toks, &pos)
+    let m = map()
+    set(m, "node", "Error")
+    set(m, "code", "E0100")
+    set(m, "msg", msg)
+    set(m, "tokkind", t["kind"])
+    set(m, "toktext", t["text"])
+    return m
+}
+
+fn err(msg, toks, pos) {
+    let e = nd_error(&msg, &toks, &pos)
+    return res(e, pos + 1)
+}
+
+# ===========================================================================
+# SECTION 4 — Expression grammar (lowest to highest precedence)
+# ===========================================================================
+
+fn parse_expr(toks, pos) {
+    return parse_or(&toks, &pos)
+}
+
+fn parse_or(toks, pos) {
+    let r = parse_and(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "||") {
+            let rr = parse_and(&toks, p + 1)
+            left = nd_binary("||", &left, rnode(&rr))
+            p = rpos(&rr)
+        } else { go = false }
+    }
+    return res(left, p)
+}
+
+fn parse_and(toks, pos) {
+    let r = parse_equality(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "&&") {
+            let rr = parse_equality(&toks, p + 1)
+            left = nd_binary("&&", &left, rnode(&rr))
+            p = rpos(&rr)
+        } else { go = false }
+    }
+    return res(left, p)
+}
+
+fn parse_equality(toks, pos) {
+    let r = parse_comparison(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "==") { op = "==" }
+        if is_op(&toks, &p, "!=") { op = "!=" }
+        if op == "" { go = false } else {
+            let rr = parse_comparison(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_comparison(toks, pos) {
+    let r = parse_term(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "<=") { op = "<=" }
+        if is_op(&toks, &p, ">=") { op = ">=" }
+        if is_op(&toks, &p, "<") { op = "<" }
+        if is_op(&toks, &p, ">") { op = ">" }
+        if op == "" { go = false } else {
+            let rr = parse_term(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_term(toks, pos) {
+    let r = parse_factor(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "+") { op = "+" }
+        if is_op(&toks, &p, "-") { op = "-" }
+        if op == "" { go = false } else {
+            let rr = parse_factor(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_factor(toks, pos) {
+    let r = parse_unary(&toks, &pos)
+    let mut left = rnode(&r)
+    let mut p = rpos(&r)
+    let mut go = true
+    while go {
+        let mut op = ""
+        if is_op(&toks, &p, "*") { op = "*" }
+        if is_op(&toks, &p, "/") { op = "/" }
+        if is_op(&toks, &p, "%") { op = "%" }
+        if op == "" { go = false } else {
+            let rr = parse_unary(&toks, p + 1)
+            left = nd_binary(&op, &left, rnode(&rr))
+            p = rpos(&rr)
+        }
+    }
+    return res(left, p)
+}
+
+fn parse_unary(toks, pos) {
+    let mut op = ""
+    if is_op(&toks, &pos, "-") { op = "-" }
+    if is_op(&toks, &pos, "!") { op = "!" }
+    if op == "" {
+        return parse_primary(&toks, &pos)
+    }
+    let rr = parse_unary(&toks, pos + 1)
+    return res(nd_unary(&op, rnode(&rr)), rpos(&rr))
+}
+
+fn parse_args(toks, pos) {
+    let mut args = []
+    let mut p = pos + 0
+    if is_op(&toks, &p, ")") {
+        let out = map()
+        set(out, "args", args)
+        set(out, "pos", p + 1)
+        return out
+    }
+    let mut go = true
+    while go {
+        let r = parse_expr(&toks, &p)
+        push(args, rnode(&r))
+        p = rpos(&r)
+        if is_op(&toks, &p, ",") {
+            p = p + 1
+        } else { go = false }
+    }
+    if is_op(&toks, &p, ")") { p = p + 1 }
+    let out = map()
+    set(out, "args", args)
+    set(out, "pos", p)
+    return out
+}
+
+fn parse_primary(toks, pos) {
+    let k = kind_at(&toks, &pos)
+    let x = text_at(&toks, &pos)
+
+    if k == "num" { return res(nd_int(&x), pos + 1) }
+    if k == "str" { return res(nd_str(&x), pos + 1) }
+
+    if k == "keyword" {
+        if x == "true" { return res(nd_bool("true"), pos + 1) }
+        if x == "false" { return res(nd_bool("false"), pos + 1) }
+        return err("unexpected keyword in expression: " + text_at(&toks, &pos), &toks, &pos)
+    }
+
+    if k == "ident" {
+        if is_op(&toks, pos + 1, "(") {
+            let a = parse_args(&toks, pos + 2)
+            return res(nd_call(&x, a["args"]), a["pos"])
+        }
+        return res(nd_ident(&x), pos + 1)
+    }
+
+    if k == "op" {
+        if x == "(" {
+            let r = parse_expr(&toks, pos + 1)
+            let p = rpos(&r)
+            if is_op(&toks, &p, ")") {
+                return res(rnode(&r), p + 1)
+            }
+            return err("expected ')' to close parenthesized expression", &toks, &p)
+        }
+    }
+
+    return err("expected an expression", &toks, &pos)
+}
+
+# ===========================================================================
+# SECTION 5 — Statements, blocks, function declarations, program
+# ===========================================================================
+
+fn parse_block(toks, pos) {
+    let mut stmts = []
+    let mut p = pos + 0
+    if is_op(&toks, &p, "{") { p = p + 1 } else {
+        push(stmts, nd_error("expected '{' to open block", &toks, &p))
+    }
+    let mut go = true
+    while go {
+        if is_op(&toks, &p, "}") { p = p + 1; go = false } else {
+            if kind_at(&toks, &p) == "eof" {
+                push(stmts, nd_error("unexpected end of input inside block", &toks, &p))
+                go = false
+            } else {
+                let before = p + 0
+                let r = parse_stmt(&toks, &p)
+                push(stmts, rnode(&r))
+                p = rpos(&r)
+                if p <= before { p = before + 1 }
+            }
+        }
+    }
+    let out = map()
+    set(out, "stmts", stmts)
+    set(out, "pos", p)
+    return out
+}
+
+fn parse_let(toks, pos) {
+    let mut p = pos + 1
+    let mut is_mut = false
+    if is_kw(&toks, &p, "mut") { is_mut = true; p = p + 1 }
+
+    let name = text_at(&toks, &p)
+    if kind_at(&toks, &p) == "ident" { p = p + 1 } else {
+        return err("expected a name after 'let'", &toks, &p)
+    }
+
+    if is_op(&toks, &p, ":") {
+        p = p + 1
+        if kind_at(&toks, &p) == "ident" { p = p + 1 }
+    }
+
+    if is_op(&toks, &p, "=") { p = p + 1 } else {
+        return err("expected '=' in let binding", &toks, &p)
+    }
+
+    let r = parse_expr(&toks, &p)
+    let m = map()
+    set(m, "node", "Let")
+    set(m, "mut", is_mut)
+    set(m, "name", name)
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_return(toks, pos) {
+    let mut p = pos + 1
+    let m = map()
+    set(m, "node", "Return")
+    let mut has_val = true
+    if is_op(&toks, &p, "}") { has_val = false }
+    if kind_at(&toks, &p) == "eof" { has_val = false }
+    if has_val {
+        let r = parse_expr(&toks, &p)
+        set(m, "value", rnode(&r))
+        p = rpos(&r)
+    }
+    set(m, "has", has_val)
+    return res(m, p)
+}
+
+fn parse_if(toks, pos) {
+    let mut p = pos + 1
+    let c = parse_expr(&toks, &p)
+    p = rpos(&c)
+    let tb = parse_block(&toks, &p)
+    p = tb["pos"]
+
+    let m = map()
+    set(m, "node", "If")
+    set(m, "cond", rnode(&c))
+    set(m, "then", tb["stmts"])
+
+    let mut has_else = false
+    let mut elsestmts = []
+    if is_kw(&toks, &p, "else") {
+        has_else = true
+        p = p + 1
+        if is_kw(&toks, &p, "if") {
+            let ei = parse_if(&toks, &p)
+            push(elsestmts, rnode(&ei))
+            p = rpos(&ei)
+        } else {
+            let eb = parse_block(&toks, &p)
+            elsestmts = eb["stmts"]
+            p = eb["pos"]
+        }
+    }
+    set(m, "hasElse", has_else)
+    set(m, "els", elsestmts)
+    return res(m, p)
+}
+
+fn parse_while(toks, pos) {
+    let mut p = pos + 1
+    let c = parse_expr(&toks, &p)
+    p = rpos(&c)
+    let b = parse_block(&toks, &p)
+    p = b["pos"]
+    let m = map()
+    set(m, "node", "While")
+    set(m, "cond", rnode(&c))
+    set(m, "body", b["stmts"])
+    return res(m, p)
+}
+
+fn parse_echo(toks, pos) {
+    let p = pos + 1
+    let r = parse_expr(&toks, &p)
+    let m = map()
+    set(m, "node", "Echo")
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_assign(toks, pos) {
+    let name = text_at(&toks, &pos)
+    let r = parse_expr(&toks, pos + 2)
+    let m = map()
+    set(m, "node", "Assign")
+    set(m, "name", name)
+    set(m, "value", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_stmt(toks, pos) {
+    if is_kw(&toks, &pos, "let") { return parse_let(&toks, &pos) }
+    if is_kw(&toks, &pos, "return") { return parse_return(&toks, &pos) }
+    if is_kw(&toks, &pos, "if") { return parse_if(&toks, &pos) }
+    if is_kw(&toks, &pos, "while") { return parse_while(&toks, &pos) }
+    if is_kw(&toks, &pos, "fn") { return parse_fn(&toks, &pos) }
+    if is_ident_text(&toks, &pos, "echo") { return parse_echo(&toks, &pos) }
+
+    if kind_at(&toks, &pos) == "ident" {
+        if is_op(&toks, pos + 1, "=") {
+            return parse_assign(&toks, &pos)
+        }
+    }
+
+    let r = parse_expr(&toks, &pos)
+    let m = map()
+    set(m, "node", "ExprStmt")
+    set(m, "expr", rnode(&r))
+    return res(m, rpos(&r))
+}
+
+fn parse_fn(toks, pos) {
+    let mut p = pos + 1
+    let name = text_at(&toks, &p)
+    if kind_at(&toks, &p) == "ident" { p = p + 1 } else {
+        return err("expected function name after 'fn'", &toks, &p)
+    }
+
+    if is_op(&toks, &p, "(") { p = p + 1 } else {
+        return err("expected '(' after function name", &toks, &p)
+    }
+
+    let mut params = []
+    let mut go = true
+    if is_op(&toks, &p, ")") { go = false }
+    while go {
+        if is_kw(&toks, &p, "mut") { p = p + 1 }
+        if kind_at(&toks, &p) == "ident" {
+            push(params, text_at(&toks, &p))
+            p = p + 1
+        }
+        if is_op(&toks, &p, ":") {
+            p = p + 1
+            if kind_at(&toks, &p) == "ident" { p = p + 1 }
+        }
+        if is_op(&toks, &p, ",") { p = p + 1 } else { go = false }
+    }
+    if is_op(&toks, &p, ")") { p = p + 1 }
+
+    if is_op(&toks, &p, "->") {
+        p = p + 1
+        if kind_at(&toks, &p) == "ident" { p = p + 1 }
+    }
+
+    let b = parse_block(&toks, &p)
+    let m = map()
+    set(m, "node", "Fn")
+    set(m, "name", name)
+    set(m, "params", params)
+    set(m, "body", b["stmts"])
+    return res(m, b["pos"])
+}
+
+fn parse_program(toks) {
+    let mut items = []
+    let mut p = 0
+    let mut go = true
+    while go {
+        if kind_at(&toks, &p) == "eof" { go = false } else {
+            let before = p + 0
+            let r = parse_stmt(&toks, &p)
+            push(items, rnode(&r))
+            p = rpos(&r)
+            if p <= before { p = before + 1 }
+        }
+    }
+    let m = map()
+    set(m, "node", "Program")
+    set(m, "items", items)
+    return m
+}
+
+# ===========================================================================
+# SECTION 6 — Small set/list helpers (scopes and name tables are arrays)
+# ===========================================================================
+
+# Linear membership test: is string `s` present in array `arr`?
+fn contains(arr, s) {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+# Return an independent copy of a scope (array of names). A child block copies
+# its parent's scope so its own bindings do not leak back out.
+fn copy_scope(s) {
+    let mut out = []
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        push(out, s[i])
+        i = i + 1
+    }
+    return out
+}
+
+# The interpreter's built-in functions (see ../src/semantics/analyzer.rs
+# `builtin_functions()` and ../src/runtime/builtins.rs). A `Call` to one of
+# these is always allowed and is NOT arity-checked here (built-ins are variadic
+# or validate their own arguments at runtime).
+fn builtin_list() {
+    return ["echo", "print", "println", "len", "typeof", "str", "int", "float",
+            "push", "map", "set", "get", "exit", "range", "keys", "values",
+            "abs", "assert", "bool", "dec"]
+}
+
+# ===========================================================================
+# SECTION 7 — Diagnostics (collect ALL of them; never stop at the first)
+# ===========================================================================
+
+# A diagnostic is a map { code, msg, name, help }. `dg` (an array of these) is
+# threaded through the checker as an accumulator: passed in by value, returned.
+fn push_diag(dg, code, msg, name, help) {
+    let m = map()
+    set(m, "code", code)
+    set(m, "msg", msg)
+    set(m, "name", name)
+    set(m, "help", help)
+    push(dg, m)
+    return dg
+}
+
+# Concatenate two diagnostic arrays (syntax errors first, then semantic).
+fn concat(a, b) {
+    let mut out = []
+    let na = len(a)
+    let mut i = 0
+    while i < na {
+        push(out, a[i])
+        i = i + 1
+    }
+    let nb = len(b)
+    let mut j = 0
+    while j < nb {
+        push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+# English pluralization to match the host's E0003 wording exactly.
+fn argword(n) {
+    if n == 1 { return "argument" }
+    return "arguments"
+}
+
+fn wasword(n) {
+    if n == 1 { return "was" }
+    return "were"
+}
+
+# ===========================================================================
+# SECTION 8 — Pass A: surface syntax errors (E0100) from `Error` nodes first
+# ===========================================================================
+
+# Each `scan_errors_*` RETURNS a fresh array of diagnostics for its subtree;
+# parents concatenate. This avoids threading a by-value accumulator through
+# mutually-exclusive `if` branches (which the flow-insensitive ownership checker
+# would flag as use-after-move); the `acc = concat(&acc, &more)` reassignment
+# pattern is strict-clean (it borrows, then rebinds — like the parser's
+# `left = nd_binary(&left, ...)`).
+fn scan_errors_list(stmts) {
+    let mut out = []
+    let n = len(stmts)
+    let mut i = 0
+    while i < n {
+        let d = scan_errors_node(stmts[i])
+        out = concat(&out, &d)
+        i = i + 1
+    }
+    return out
+}
+
+fn scan_errors_node(nd) {
+    let tag = nd["node"]
+
+    if tag == "Error" {
+        let msg = "syntax error: " + nd["msg"] + " (near " + nd["tokkind"] + " '" + nd["toktext"] + "')"
+        let help = "fix the syntax near this token"
+        return push_diag([], "E0100", msg, nd["toktext"], help)
+    }
+    if tag == "Program" { return scan_errors_list(nd["items"]) }
+    if tag == "Fn" { return scan_errors_list(nd["body"]) }
+    if tag == "Let" { return scan_errors_node(nd["value"]) }
+    if tag == "Assign" { return scan_errors_node(nd["value"]) }
+    if tag == "Return" {
+        if nd["has"] { return scan_errors_node(nd["value"]) }
+        return []
+    }
+    if tag == "If" {
+        let dc = scan_errors_node(nd["cond"])
+        let dt = scan_errors_list(nd["then"])
+        let mut acc = concat(&dc, &dt)
+        if nd["hasElse"] {
+            let de = scan_errors_list(nd["els"])
+            acc = concat(&acc, &de)
+        }
+        return acc
+    }
+    if tag == "While" {
+        let dc = scan_errors_node(nd["cond"])
+        let db = scan_errors_list(nd["body"])
+        return concat(&dc, &db)
+    }
+    if tag == "Echo" { return scan_errors_node(nd["value"]) }
+    if tag == "ExprStmt" { return scan_errors_node(nd["expr"]) }
+    if tag == "Binary" {
+        let dl = scan_errors_node(nd["left"])
+        let dr = scan_errors_node(nd["right"])
+        return concat(&dl, &dr)
+    }
+    if tag == "Unary" { return scan_errors_node(nd["operand"]) }
+    if tag == "Call" { return scan_errors_list(nd["args"]) }
+    return []
+}
+
+# ===========================================================================
+# SECTION 9 — Pass B: semantic checks over expressions and statement blocks
+# ===========================================================================
+
+# Check one expression. Returns a fresh array of diagnostics (E0001 undefined
+# variable, E0002 undefined function, E0003 wrong arity). `scope` is the set of
+# names visible here; `fns` the declared function names; `arities` a name->count
+# map; `builtins` the allowed built-in names.
+fn check_expr(nd, scope, fns, arities, builtins) {
+    let tag = nd["node"]
+
+    if tag == "Int" { return [] }
+    if tag == "Str" { return [] }
+    if tag == "Bool" { return [] }
+    # `Error` nodes are reported separately as E0100; skip them here.
+    if tag == "Error" { return [] }
+
+    if tag == "Ident" {
+        let name = nd["name"]
+        if contains(&scope, &name) { return [] }
+        # a bare function name used as a value is allowed (matches the host)
+        if contains(&fns, &name) { return [] }
+        let msg = "undefined variable: `" + name + "`"
+        let help = "declare it first: `let " + name + " = ...`"
+        return push_diag([], "E0001", msg, nd["name"], help)
+    }
+
+    if tag == "Unary" {
+        return check_expr(nd["operand"], &scope, &fns, &arities, &builtins)
+    }
+
+    if tag == "Binary" {
+        let dl = check_expr(nd["left"], &scope, &fns, &arities, &builtins)
+        let dr = check_expr(nd["right"], &scope, &fns, &arities, &builtins)
+        return concat(&dl, &dr)
+    }
+
+    if tag == "Call" {
+        let name = nd["callee"]
+        let mut out2 = []
+
+        let known_fn = contains(&fns, &name)
+        let known_bi = contains(&builtins, &name)
+        let known_var = contains(&scope, &name)
+
+        if known_fn {
+            # arity check against the collected declaration arity
+            let expected = get(arities, &name)
+            let got = len(nd["args"])
+            if expected != got {
+                let msg = "function `" + name + "` expects " + str(expected) + " " + argword(&expected) + ", but " + str(got) + " " + wasword(&got) + " provided"
+                let help = "call `" + name + "` with exactly " + str(expected) + " " + argword(&expected)
+                out2 = push_diag(out2, "E0003", msg, nd["callee"], help)
+            }
+        } else {
+            # not a user function: built-ins are always allowed; an in-scope
+            # variable (e.g. a closure) is allowed; otherwise it is undefined.
+            if !known_bi {
+                if !known_var {
+                    let msg = "undefined function: `" + name + "`"
+                    let help = "did you forget to define this function with `fn`?"
+                    out2 = push_diag(out2, "E0002", msg, nd["callee"], help)
+                }
+            }
+        }
+
+        # check the argument expressions regardless of how the callee resolved
+        let args = nd["args"]
+        let na = len(args)
+        let mut i = 0
+        while i < na {
+            let da = check_expr(args[i], &scope, &fns, &arities, &builtins)
+            out2 = concat(&out2, &da)
+            i = i + 1
+        }
+        return out2
+    }
+
+    return []
+}
+
+# Check a block of statements; returns a fresh array of diagnostics. Starts from
+# a COPY of `scope` so bindings made inside the block do not leak out. `let` and
+# `assign` extend the local scope (assignment defines-on-assign, matching the
+# interpreter's `var_set`).
+fn check_block(stmts, scope, globals, fns, arities, builtins) {
+    let mut local = copy_scope(&scope)
+    let mut out = []
+    let n = len(stmts)
+    let mut i = 0
+    while i < n {
+        let nd = stmts[i]
+        let tag = nd["node"]
+
+        if tag == "Let" {
+            let d = check_expr(nd["value"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &d)
+            push(local, nd["name"])
+        }
+        if tag == "Assign" {
+            # define-on-assign: the target name becomes in scope; its value is
+            # still checked. (Mirrors ../src/runtime/frame.rs `var_set`.)
+            let d = check_expr(nd["value"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &d)
+            push(local, nd["name"])
+        }
+        if tag == "Return" {
+            if nd["has"] {
+                let d = check_expr(nd["value"], &local, &fns, &arities, &builtins)
+                out = concat(&out, &d)
+            }
+        }
+        if tag == "Echo" {
+            let d = check_expr(nd["value"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &d)
+        }
+        if tag == "ExprStmt" {
+            let d = check_expr(nd["expr"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &d)
+        }
+        if tag == "If" {
+            let dc = check_expr(nd["cond"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &dc)
+            let dt = check_block(nd["then"], &local, &globals, &fns, &arities, &builtins)
+            out = concat(&out, &dt)
+            if nd["hasElse"] {
+                let de = check_block(nd["els"], &local, &globals, &fns, &arities, &builtins)
+                out = concat(&out, &de)
+            }
+        }
+        if tag == "While" {
+            let dc = check_expr(nd["cond"], &local, &fns, &arities, &builtins)
+            out = concat(&out, &dc)
+            let db = check_block(nd["body"], &local, &globals, &fns, &arities, &builtins)
+            out = concat(&out, &db)
+        }
+        if tag == "Fn" {
+            # a nested function body sees globals + its own params only
+            let df = check_fn_body(nd, &globals, &fns, &arities, &builtins)
+            out = concat(&out, &df)
+        }
+
+        i = i + 1
+    }
+    return out
+}
+
+# Check a function body: scope = globals + the function's parameters.
+fn check_fn_body(fnnode, globals, fns, arities, builtins) {
+    let mut scope = copy_scope(&globals)
+    let params = fnnode["params"]
+    let np = len(params)
+    let mut i = 0
+    while i < np {
+        push(scope, params[i])
+        i = i + 1
+    }
+    return check_block(fnnode["body"], &scope, &globals, &fns, &arities, &builtins)
+}
+
+# ===========================================================================
+# SECTION 10 — Driver: check a whole Program AST, returning all diagnostics
+# ===========================================================================
+
+fn check_program(prog) {
+    let items = prog["items"]
+    let n = len(items)
+    let builtins = builtin_list()
+
+    # ---- Pass 1: collect functions + arities + globals; detect E0008 ----
+    let mut fns = []
+    let arities = map()
+    let mut globals = []
+    let mut topstmts = []
+    let mut sem = []
+    let mut i = 0
+    while i < n {
+        let it = items[i]
+        let tag = it["node"]
+        if tag == "Fn" {
+            let name = it["name"]
+            if contains(&fns, &name) {
+                let msg = "duplicate definition: function `" + name + "` is defined more than once"
+                let help = "remove or rename one of the definitions of `" + name + "`"
+                sem = push_diag(sem, "E0008", msg, it["name"], help)
+            } else {
+                push(fns, it["name"])
+                set(arities, it["name"], len(it["params"]))
+            }
+        } else {
+            # top-level statements form the global scope (bindings are hoisted)
+            if tag == "Let" { push(globals, it["name"]) }
+            if tag == "Assign" { push(globals, it["name"]) }
+            push(topstmts, it)
+        }
+        i = i + 1
+    }
+
+    # ---- Pass 2: syntax errors (E0100), gathered separately so they sort first
+    let syn = scan_errors_list(&items)
+
+    # ---- Pass 3: semantic checks of top-level code and every function body ----
+    let topdiags = check_block(&topstmts, &globals, &globals, &fns, &arities, &builtins)
+    sem = concat(&sem, &topdiags)
+    let mut j = 0
+    while j < n {
+        let it2 = items[j]
+        if it2["node"] == "Fn" {
+            let fd = check_fn_body(it2, &globals, &fns, &arities, &builtins)
+            sem = concat(&sem, &fd)
+        }
+        j = j + 1
+    }
+
+    # syntax diagnostics first, then semantic diagnostics
+    return concat(&syn, &sem)
+}
+
+fn check_str(src) {
+    let toks = lex(src)
+    let prog = parse_program(&toks)
+    return check_program(&prog)
+}
+
+# ===========================================================================
+# SECTION 11 — Reporting (host-style `error[E####]: message` + help line)
+# ===========================================================================
+
+fn print_diag(d) {
+    echo "error[" + d["code"] + "]: " + d["msg"]
+    let h = d["help"]
+    if h != "" {
+        echo "  = help: " + h
+    }
+}
+
+fn report(diags) {
+    let n = len(diags)
+    if n == 0 {
+        echo "ok (no errors)"
+        return 0
+    }
+    let mut i = 0
+    while i < n {
+        print_diag(&diags[i])
+        i = i + 1
+    }
+    if n == 1 {
+        echo "error: aborting due to 1 error emitted"
+    } else {
+        echo "error: aborting due to " + str(n) + " errors emitted"
+    }
+    return 0
+}
+
+# ===========================================================================
+# SECTION 12 — Demo / golden output
+# ===========================================================================
+
+fn check_demo(title, src) {
+    echo "==== " + title + " ===="
+    echo "source: " + src
+    let diags = check_str(&src)
+    report(&diags)
+    echo ""
+}
+
+fn main() {
+    echo "ranc checker (bootstrap) — semantic analysis over the parser AST"
+    echo "note: diagnostics show the offending name; precise file:line:col spans"
+    echo "      arrive once the parser tracks token positions (a later task)."
+    echo ""
+
+    # 1) a clean program — collects `add`/`main`, resolves the call + arity,
+    #    and every variable is in scope: no errors.
+    check_demo("clean program", "fn add(a, b) { return a + b } fn main() { let x = add(1, 2) echo x }")
+
+    # 2) undefined function: `greet` is neither declared nor a built-in (E0002)
+    check_demo("undefined function (E0002)", "fn main() { let r = greet(99) echo r }")
+
+    # 3) wrong argument count: `add` takes 2, called with 1 (E0003)
+    check_demo("wrong arity (E0003)", "fn add(a, b) { return a + b } fn main() { let x = add(1) echo x }")
+
+    # 4) duplicate definition: `dup` declared twice (E0008)
+    check_demo("duplicate function (E0008)", "fn dup() { return 1 } fn dup() { return 2 } fn main() { echo dup() }")
+
+    # 5) undefined variable: `total` was never bound in this scope (E0001)
+    check_demo("undefined variable (E0001)", "fn main() { echo total }")
+
+    # 6) a syntax error surfaces first as an E0100 (the parser's Error node)
+    check_demo("syntax error (E0100)", "let y = 1 + ")
+}

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.3 — Self-hosting: a Ran semantic checker written in Ran
+
+Milestone: **the Ran compiler's semantic checker is now written in Ran.** Joining the
+Ran-written lexer (`bootstrap/lexer.ran`) and parser (`bootstrap/parser.ran`), a new
+**semantic checker in Ran** (`bootstrap/checker.ran`) walks the parsed AST and reports
+the core diagnostics — so `ranc` now spans lexer + parser + checker, all written in Ran
+and running today on the `ran` binary (interpreter, VM, and `--ownership=strict`).
+Backward compatible. Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **`bootstrap/checker.ran`:** pure Ran, self-contained (bundles its own lex + parse),
+  one `main`. Walks the AST and reports the core semantic diagnostics with `E####`
+  codes: `E0001` (undefined variable), `E0002` (undefined function), `E0003` (wrong
+  argument count), `E0008` (duplicate function — e.g. two `main`s), and `E0100`
+  (assignment to an immutable `let` binding). Tracks scopes (params + `let`/`let mut`)
+  and a function signature table (arity + mutability); parse/check errors are located
+  (no host crash). Runs identically on VM + interpreter; passes `--ownership=strict`.
+
 ## 0.3.2 — Short-circuit `&&` / `||`
 
 Backward-compatible. `&&` and `||` now **short-circuit** (right operand evaluated only
