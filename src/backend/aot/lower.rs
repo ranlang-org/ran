@@ -88,7 +88,7 @@ fn real_module_name(path: &str) -> String {
 fn is_bridged_module(m: &str) -> bool {
     matches!(
         m,
-        "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json" | "env" | "db"
+        "time" | "log" | "math" | "str" | "os" | "fs" | "rand" | "json" | "env" | "db" | "http"
     )
 }
 
@@ -203,6 +203,13 @@ fn bridged_method_ret(module: &str, method: &str) -> Option<Option<CType>> {
         //     type is `Value` for all of them. ---
         ("db", "connect") | ("db", "close") | ("db", "query") | ("db", "exec")
         | ("db", "begin") | ("db", "commit") | ("db", "rollback") => Some(Value),
+
+        // --- http client (plaintext http:// via sockets, https:// via the
+        //     system OpenSSL). Each returns the response Map
+        //     {status:int, body:str, ok:bool, error:str}, byte-for-byte matching
+        //     the interpreter's `http_client_call`. (The server side — http.get/
+        //     post/server/... handler registration — is not yet native.) ---
+        ("http", "fetch") | ("http", "post_to") | ("http", "request") => Some(Value),
 
         _ => return None,
     };
@@ -339,7 +346,7 @@ pub fn supported(checked: &CheckedProgram, file: &str) -> Result<(), Diagnostic>
                         stmt.span.col,
                         &format!(
                             "import of module `{}` (bridged native modules are \
-                             time, log, math, str, os, fs, rand, json, env, db)",
+                             time, log, math, str, os, fs, rand, json, env, db, http)",
                             module
                         ),
                     ));
@@ -2391,9 +2398,9 @@ fn main() {
 
     #[test]
     fn supported_rejects_imports() {
-        // A NON-bridged module import stays a hard E0606 (http is D4b).
+        // A NON-bridged module import stays a hard E0606 (web is not bridged).
         let src = r#"
-import "std::http" as http
+import "std::web" as web
 fn main() {
     echo "hi"
 }
@@ -2718,17 +2725,43 @@ fn main() { echo time.now_ms() }
 
     #[test]
     fn supported_rejects_unbridged_module_still_e0606() {
-        // A still-unbridged module (e.g. http) remains a hard E0606 even though
-        // db is now accepted — the bridge is additive, not a blanket opening.
+        // A still-unbridged module (e.g. web) remains a hard E0606 even though
+        // db and http are now accepted — the bridge is additive, not a blanket
+        // opening.
         let src = r#"
-import "std::http" as http
+import "std::web" as web
 fn main() {
-    let r = http.get("https://example.com")
+    web.serve("public")
     echo "x"
 }
 "#;
         let checked = check(src);
-        let err = supported(&checked, "test.ran").expect_err("http is not bridged");
+        let err = supported(&checked, "test.ran").expect_err("web is not bridged");
+        assert_eq!(err.code.as_deref(), Some("E0606"));
+    }
+
+    #[test]
+    fn supported_accepts_http_client_but_rejects_server() {
+        // D4b-4: the http CLIENT (fetch/post_to/request) is native...
+        let client = r#"
+import "std::http" as http
+fn main() {
+    let r = http.fetch("http://127.0.0.1:9/")
+    echo "done"
+}
+"#;
+        supported(&check(client), "test.ran").expect("http client must be accepted");
+
+        // ...but the server side (handler registration) is not yet native.
+        let server = r#"
+import "std::http" as http
+fn main() {
+    http.get("/", "home")
+    http.server(8080)
+}
+"#;
+        let err = supported(&check(server), "test.ran")
+            .expect_err("http server methods are not native yet");
         assert_eq!(err.code.as_deref(), Some("E0606"));
     }
 

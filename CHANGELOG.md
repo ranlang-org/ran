@@ -11,11 +11,39 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next (native track): the HTTP client (TLS via system OpenSSL FFI) and HTTP server,
-then `concurrency` (`spawn`/channels via pthreads). `crypto` stays a thin FFI bridge
-to a vetted, mature library (no hand-rolled crypto). Self-hosting track:
-`bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D bootstrap fixed point that
-defines 1.0.0. Plus `--link-static` and making native the default once the subset matures.
+Next (native track): the native HTTP **server** — blocked on a runtime request-context
+mechanism (the interpreter injects `req_*`/`query_*`/`param_*`/`cookie_*` as runtime
+globals that zero-arg handlers read by name; native codegen needs an equivalent
+context store before handlers can compile), then `concurrency` (`spawn`/channels via
+pthreads). `crypto` stays a thin FFI bridge to OpenSSL (no hand-rolled crypto).
+Self-hosting track: `bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D bootstrap
+fixed point that defines 1.0.0. Plus `--link-static` and making native the default.
+
+## [0.3.5] — Native HTTP client (http + https/TLS)
+
+Backward-compatible. `ran build --native` can now build HTTP **client** programs: the
+`http` module's `fetch`/`post_to`/`request` are bridged into the C runtime, with
+`http://` over libc sockets and `https://` over the system OpenSSL (certificate +
+hostname verification against the default trust store) — the same transports the
+interpreter uses. Programs that never import `http` link nothing extra.
+
+### Added — native `http` client
+
+- `http.fetch(url)`, `http.post_to(url, body)`, `http.request(method, url, body)` lower
+  to `ran_mod_http_*` calls returning the response **Map** `{status:int, body:str,
+  ok:bool, error:str}` in the same insertion order as the interpreter's
+  `http_client_call`. `ok` is `200..300`; a malformed URL or transport failure yields
+  `status:0` with a populated `error`.
+- `https://` uses OpenSSL (`-lssl -lcrypto`, linked only when `http` is imported) with
+  SNI, peer-certificate verification, and hostname checking; `http://` uses a
+  bounded-timeout socket connect. Response read is capped at 64 MB, matching the
+  interpreter.
+- Verified: byte-for-byte parity with the interpreter for GET/POST/request and the
+  invalid-URL error against a local server, and a real `https://` fetch (identical
+  status + body); ASan + UBSan + LSan clean. Network/OS error *text* is
+  environment-dependent (shape-matched, like `time`/`rand`).
+- **Still `E0606` natively:** the http **server** side (`http.get`/`post`/`server`/
+  `listen`/`set_header`/`set_status`/`set_cookie`/`redirect`) and `web.serve`.
 
 ## [0.3.4] — Native string memory safety (no leaks, refcount-clean)
 

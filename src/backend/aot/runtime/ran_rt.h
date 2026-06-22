@@ -371,4 +371,19 @@ RanValue ran_mod_db_begin(const RanValue *argv, int64_t argc);
 RanValue ran_mod_db_commit(const RanValue *argv, int64_t argc);
 RanValue ran_mod_db_rollback(const RanValue *argv, int64_t argc);
 
+/* http — client requests. Compiled into the runtime ONLY when the program
+ * imports `std::http` (the build passes `-DRAN_ENABLE_HTTP` and links
+ * `-lssl -lcrypto` for the TLS transport). Each returns the response Map
+ * {status:int, body:str, ok:bool, error:str}, byte-for-byte matching the
+ * interpreter's `http_client_call`. `http://` uses libc sockets; `https://`
+ * uses the system OpenSSL with certificate + hostname verification.
+ *
+ *   fetch(url)            -> GET  url
+ *   post_to(url, body)    -> POST url with body
+ *   request(method,url,body)
+ */
+RanValue ran_mod_http_fetch(const RanValue *argv, int64_t argc);
+RanValue ran_mod_http_post_to(const RanValue *argv, int64_t argc);
+RanValue ran_mod_http_request(const RanValue *argv, int64_t argc);
+
 #endif /* RAN_RT_H */

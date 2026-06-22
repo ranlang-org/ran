@@ -3020,3 +3020,354 @@ RanValue ran_mod_db_rollback(const RanValue *argv, int64_t argc) {
 }
 
 #endif /* RAN_ENABLE_SQLITE */
+
+/* ====================================================================== */
+/* http — client requests (D4b-4).                                        */
+/*                                                                        */
+/* Compiled only under -DRAN_ENABLE_HTTP (set when the program imports     */
+/* `std::http`). `http://` uses libc sockets; `https://` uses the system   */
+/* OpenSSL with certificate + hostname verification against the default    */
+/* trust store — mirroring the interpreter's `http_request`. Each entry    */
+/* point returns the Map {status:int, body:str, ok:bool, error:str} in the */
+/* same insertion order as `http_client_call`. Network/OS error text is    */
+/* environment-dependent (shape-matched, like the time and rand helpers);  */
+/* the success path (status + body) is server-determined and matches the   */
+/* interpreter.                                                            */
+/* ====================================================================== */
+#ifdef RAN_ENABLE_HTTP
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <errno.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+
+#define RAN_HTTP_TIMEOUT_S 10
+#define RAN_HTTP_MAX_RESPONSE (64u * 1024u * 1024u) /* 64 MB cap (matches interp) */
+
+/* Build the {status, body, ok, error} response map (insertion order matters
+ * only for whole-map display; per-key access is deterministic either way). */
+static RanValue http_resp(int64_t status, const char *body, const char *error) {
+    RanValue m = ran_map_new();
+    ran_map_set(m, "status", ran_from_int(status));
+    ran_map_set(m, "body", ran_from_str(body ? body : ""));
+    ran_map_set(m, "ok", ran_from_bool(status >= 200 && status < 300));
+    ran_map_set(m, "error", ran_from_str(error ? error : ""));
+    return m;
+}
+
+/* A raw, length-tracked byte buffer (response bytes may be binary; do not use
+ * the strlen-based SB which would truncate at an embedded NUL). */
+typedef struct { char *p; size_t len; size_t cap; } RawBuf;
+static void rawbuf_init(RawBuf *b) { b->cap = 4096; b->len = 0; b->p = (char *)ran_xalloc(b->cap); b->p[0] = '\0'; }
+static void rawbuf_append(RawBuf *b, const char *data, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        while (b->len + n + 1 > b->cap) b->cap *= 2;
+        char *np = (char *)ran_xalloc(b->cap);
+        memcpy(np, b->p, b->len);
+        free(b->p);
+        b->p = np;
+    }
+    memcpy(b->p + b->len, data, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+}
+
+/* TCP connect with a bounded wait (non-blocking connect + select). Returns a
+ * connected, blocking socket fd with send/recv timeouts set, or -1 (err set). */
+static int http_tcp_connect(const char *host, int port, char *err, size_t errlen) {
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        snprintf(err, errlen, "could not resolve host: %s", host);
+        return -1;
+    }
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0) { fcntl(fd, F_SETFL, fl); break; }
+        if (errno == EINPROGRESS) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(fd, &wf);
+            struct timeval tv = { RAN_HTTP_TIMEOUT_S, 0 };
+            rc = select(fd + 1, NULL, &wf, NULL, &tv);
+            if (rc > 0) {
+                int soerr = 0;
+                socklen_t sl = sizeof(soerr);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+                if (soerr == 0) { fcntl(fd, F_SETFL, fl); break; }
+            }
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        snprintf(err, errlen, "connect error: %s", host);
+        return -1;
+    }
+    struct timeval tv = { RAN_HTTP_TIMEOUT_S, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+/* Compose the HTTP/1.1 request bytes (byte-identical to the interpreter). */
+static const char *http_build_request(const char *method, const char *host,
+                                       const char *path, const char *body) {
+    SB b;
+    sb_init(&b);
+    /* method uppercased */
+    char m[16];
+    size_t mi = 0;
+    for (const char *q = method; *q && mi < sizeof(m) - 1; q++) m[mi++] = (char)toupper((unsigned char)*q);
+    m[mi] = '\0';
+    sb_push(&b, m);
+    sb_push(&b, " ");
+    sb_push(&b, path && *path ? path : "/");
+    sb_push(&b, " HTTP/1.1\r\nHost: ");
+    sb_push(&b, host);
+    sb_push(&b, "\r\nUser-Agent: ran/0.1\r\nAccept: */*\r\nConnection: close\r\n");
+    if (body && *body) {
+        char cl[64];
+        snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", strlen(body));
+        sb_push(&b, cl);
+        sb_push(&b, "Content-Type: application/x-www-form-urlencoded\r\n");
+    }
+    sb_push(&b, "\r\n");
+    if (body && *body) sb_push(&b, body);
+    return ran_str_keep(b.buf); /* reclaimed at the statement drain */
+}
+
+/* Parse the response: status from the first line's 2nd token; body after the
+ * first CRLFCRLF. Returns the {status,body,ok,error} map. */
+static RanValue http_parse_response(const RawBuf *raw) {
+    size_t split = (size_t)-1;
+    if (raw->len >= 4) {
+        for (size_t i = 0; i + 4 <= raw->len; i++) {
+            if (raw->p[i] == '\r' && raw->p[i + 1] == '\n' &&
+                raw->p[i + 2] == '\r' && raw->p[i + 3] == '\n') { split = i; break; }
+        }
+    }
+    /* status: first line, second whitespace-delimited token. */
+    int64_t status = 0;
+    {
+        size_t i = 0;
+        while (i < raw->len && raw->p[i] != '\r' && raw->p[i] != '\n') i++;
+        size_t linelen = i;
+        size_t j = 0;
+        while (j < linelen && raw->p[j] != ' ' && raw->p[j] != '\t') j++; /* skip "HTTP/1.1" */
+        while (j < linelen && (raw->p[j] == ' ' || raw->p[j] == '\t')) j++;
+        long code = 0;
+        bool any = false;
+        while (j < linelen && raw->p[j] >= '0' && raw->p[j] <= '9') { code = code * 10 + (raw->p[j] - '0'); j++; any = true; }
+        if (any) status = (int64_t)code;
+    }
+    const char *body = "";
+    char *body_owned = NULL;
+    if (split != (size_t)-1) {
+        size_t bstart = split + 4;
+        size_t blen = raw->len - bstart;
+        body_owned = (char *)ran_xalloc(blen + 1);
+        memcpy(body_owned, raw->p + bstart, blen);
+        body_owned[blen] = '\0';
+        body = body_owned;
+    }
+    RanValue m = http_resp(status, body, NULL);
+    if (body_owned) free(body_owned);
+    return m;
+}
+
+/* Read the full response from a plaintext socket into `raw` (capped). */
+static int http_recv_plain(int fd, RawBuf *raw, char *err, size_t errlen) {
+    char chunk[16384];
+    for (;;) {
+        ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n > 0) {
+            rawbuf_append(raw, chunk, (size_t)n);
+            if (raw->len >= RAN_HTTP_MAX_RESPONSE) break;
+            continue;
+        }
+        if (n == 0) break; /* peer closed */
+        if (errno == EINTR) continue;
+        snprintf(err, errlen, "io error: recv failed");
+        return -1;
+    }
+    return 0;
+}
+
+static int http_send_all_plain(int fd, const char *data, size_t len, char *err, size_t errlen) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, data + off, len - off, 0);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        snprintf(err, errlen, "io error: send failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* https:// transport via OpenSSL: connect TCP, TLS handshake with peer +
+ * hostname verification, exchange, parse. */
+static RanValue http_do_tls(const char *method, const char *host, int port,
+                            const char *path, const char *body) {
+    char err[256];
+    int fd = http_tcp_connect(host, port, err, sizeof(err));
+    if (fd < 0) return http_resp(0, "", err);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { close(fd); return http_resp(0, "", "tls connect error: SSL_CTX_new failed"); }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        SSL_CTX_free(ctx); close(fd);
+        return http_resp(0, "", "tls connect error: cannot load trust store");
+    }
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); close(fd); return http_resp(0, "", "tls connect error: SSL_new failed"); }
+    SSL_set_fd(ssl, fd);
+    SSL_set_tlsext_host_name(ssl, host);          /* SNI */
+    X509_VERIFY_PARAM *vp = SSL_get0_param(ssl);
+    X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    X509_VERIFY_PARAM_set1_host(vp, host, 0);     /* hostname verification */
+
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+        return http_resp(0, "", "tls connect error: handshake failed (certificate or hostname)");
+    }
+
+    const char *req = http_build_request(method, host, path, body);
+    size_t reqlen = strlen(req);
+    RanValue out;
+    char terr[256];
+    size_t off = 0;
+    int failed = 0;
+    while (off < reqlen) {
+        int n = SSL_write(ssl, req + off, (int)(reqlen - off));
+        if (n > 0) { off += (size_t)n; continue; }
+        snprintf(terr, sizeof(terr), "tls connect error: write failed");
+        failed = 1; break;
+    }
+    if (failed) {
+        out = http_resp(0, "", terr);
+    } else {
+        RawBuf raw; rawbuf_init(&raw);
+        for (;;) {
+            char chunk[16384];
+            int n = SSL_read(ssl, chunk, sizeof(chunk));
+            if (n > 0) {
+                rawbuf_append(&raw, chunk, (size_t)n);
+                if (raw.len >= RAN_HTTP_MAX_RESPONSE) break;
+                continue;
+            }
+            break; /* clean close or error -> stop reading */
+        }
+        out = http_parse_response(&raw);
+        free(raw.p);
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(fd);
+    return out;
+}
+
+/* Core: parse the URL, dispatch to the http/https transport. */
+static RanValue http_do(const char *method, const char *url, const char *body) {
+    int is_tls = 0;
+    const char *rest = NULL;
+    int default_port = 80;
+    if (strncmp(url, "https://", 8) == 0) { is_tls = 1; rest = url + 8; default_port = 443; }
+    else if (strncmp(url, "http://", 7) == 0) { is_tls = 0; rest = url + 7; default_port = 80; }
+    else {
+        char e[512];
+        snprintf(e, sizeof(e), "invalid URL (expected http:// or https://): %s", url);
+        return http_resp(0, "", e);
+    }
+
+    /* host_port / path split at the first '/'. */
+    const char *slash = strchr(rest, '/');
+    char host_port[1024];
+    const char *path;
+    if (slash) {
+        size_t hl = (size_t)(slash - rest);
+        if (hl >= sizeof(host_port)) hl = sizeof(host_port) - 1;
+        memcpy(host_port, rest, hl);
+        host_port[hl] = '\0';
+        path = slash;
+    } else {
+        snprintf(host_port, sizeof(host_port), "%s", rest);
+        path = "/";
+    }
+
+    /* host / port split at the LAST ':' (matches the interpreter's rfind). */
+    char host[1024];
+    int port = default_port;
+    const char *colon = strrchr(host_port, ':');
+    if (colon) {
+        size_t hl = (size_t)(colon - host_port);
+        if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+        memcpy(host, host_port, hl);
+        host[hl] = '\0';
+        int p = atoi(colon + 1);
+        port = p > 0 ? p : default_port;
+    } else {
+        snprintf(host, sizeof(host), "%s", host_port);
+    }
+
+    if (is_tls) {
+        return http_do_tls(method, host, port, path, body);
+    }
+
+    char err[256];
+    int fd = http_tcp_connect(host, port, err, sizeof(err));
+    if (fd < 0) return http_resp(0, "", err);
+
+    const char *req = http_build_request(method, host, path, body);
+    if (http_send_all_plain(fd, req, strlen(req), err, sizeof(err)) != 0) {
+        close(fd);
+        return http_resp(0, "", err);
+    }
+    RawBuf raw; rawbuf_init(&raw);
+    if (http_recv_plain(fd, &raw, err, sizeof(err)) != 0) {
+        free(raw.p);
+        close(fd);
+        return http_resp(0, "", err);
+    }
+    close(fd);
+    RanValue out = http_parse_response(&raw);
+    free(raw.p);
+    return out;
+}
+
+RanValue ran_mod_http_fetch(const RanValue *argv, int64_t argc) {
+    const char *url = marg_str(argv, argc, 0, "");
+    return http_do("GET", url, "");
+}
+RanValue ran_mod_http_post_to(const RanValue *argv, int64_t argc) {
+    const char *url = marg_str(argv, argc, 0, "");
+    const char *body = marg_str(argv, argc, 1, "");
+    return http_do("POST", url, body);
+}
+RanValue ran_mod_http_request(const RanValue *argv, int64_t argc) {
+    const char *method = marg_str(argv, argc, 0, "GET");
+    const char *url = marg_str(argv, argc, 1, "");
+    const char *body = marg_str(argv, argc, 2, "");
+    return http_do(method, url, body);
+}
+
+#endif /* RAN_ENABLE_HTTP */

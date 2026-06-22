@@ -99,6 +99,12 @@ pub fn compile_native(
     // and the db section is not even compiled — keeping the artifact lean and
     // free of an unnecessary shared-library dependency.
     let uses_db = lower::program_uses_module(checked, "db");
+    // Does the program use the `http` client? If so the runtime's http section
+    // is compiled (`-DRAN_ENABLE_HTTP`) and the system OpenSSL (`-lssl -lcrypto`)
+    // is linked for the `https://` transport. Plain `http://` needs only libc
+    // sockets, but OpenSSL is linked whenever the module is imported so any URL
+    // scheme works at runtime.
+    let uses_http = lower::program_uses_module(checked, "http");
 
     // 2. Lower to C (E0602 on failure).
     let c_source = lower::lower(checked, file)?;
@@ -132,7 +138,15 @@ pub fn compile_native(
     // 5. Compile the generated program and the runtime to object files (E0603).
     //    When `db` is used, both are compiled with `-DRAN_ENABLE_SQLITE` so the
     //    runtime's SQLite section is included and `<sqlite3.h>` is in scope.
-    let defines: &[&str] = if uses_db { &["RAN_ENABLE_SQLITE"] } else { &[] };
+    let defines: &[&str] = if uses_db && uses_http {
+        &["RAN_ENABLE_SQLITE", "RAN_ENABLE_HTTP"]
+    } else if uses_db {
+        &["RAN_ENABLE_SQLITE"]
+    } else if uses_http {
+        &["RAN_ENABLE_HTTP"]
+    } else {
+        &[]
+    };
     compile_object(&cc, &c_path, &obj_prog, &build_dir, file, defines)?;
     compile_object(&cc, &rt_c_path, &obj_rt, &build_dir, file, defines)?;
 
@@ -153,6 +167,13 @@ pub fn compile_native(
         // dlopen); a fully static archive is a later task (13.3). Placed after
         // the objects so the linker resolves the runtime's sqlite3_* references.
         link_cmd.arg("-lsqlite3");
+    }
+    if uses_http {
+        // The http client's `https://` transport uses the system OpenSSL via
+        // direct FFI (`#include <openssl/ssl.h>`). Linked after the objects so
+        // the runtime's SSL_*/X509_* references resolve. Plain `http://` uses
+        // only libc sockets and needs no extra library.
+        link_cmd.arg("-lssl").arg("-lcrypto");
     }
     if opts.link_static {
         // D1 links nothing beyond the C runtime; `-static` is harmless here and

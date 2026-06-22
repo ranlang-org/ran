@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.5 — Native HTTP client (http + https/TLS)
+
+Backward-compatible. `ran build --native` can now build HTTP **client** programs: the
+`http` module's `fetch`/`post_to`/`request` are bridged into the C runtime — `http://`
+over libc sockets, `https://` over the system OpenSSL (certificate + hostname
+verification). Programs that never import `http` link nothing extra. Summary in the root
+[`CHANGELOG.md`](../CHANGELOG.md).
+
+- `http.fetch(url)` / `http.post_to(url, body)` / `http.request(method, url, body)`
+  return the response Map `{status:int, body:str, ok:bool, error:str}` (insertion order
+  matching the interpreter); `ok` is `200..300`, a bad URL/transport failure gives
+  `status:0` + `error`.
+- `https://` uses OpenSSL (`-lssl -lcrypto`, linked only when `http` is imported) with
+  SNI + peer-cert + hostname verification; reads capped at 64 MB.
+- Verified: byte-for-byte parity (local GET/POST/request + invalid-URL, and a real
+  `https://` fetch); ASan + UBSan + LSan clean.
+- Still `E0606` natively: the http **server** side and `web.serve` (the server's
+  runtime request-context injection is not yet modeled in native codegen).
+
 ## 0.3.4 — Native string memory safety (no leaks, refcount-clean)
 
 Backward-compatible; native output is byte-for-byte unchanged. The native AOT path used
