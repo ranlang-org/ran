@@ -21,7 +21,7 @@ ran build hello.ran -o hello
 ./hello
 ```
 
-> Status: v0.3.6, under active development. This README and `docs/` describe what
+> Status: v0.3.7, under active development. This README and `docs/` describe what
 > works today; partial or planned features are labelled. See `docs/16-roadmap.md`.
 
 ---

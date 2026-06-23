@@ -1,6 +1,6 @@
 # Roadmap & Feature Status
 
-This page is the honest, single-source status list for Ran v0.3.6. It separates what
+This page is the honest, single-source status list for Ran v0.3.7. It separates what
 works today from what is partial and what is planned. When a doc elsewhere says "Status
 note", this is the page it points back to.
 

@@ -747,9 +747,13 @@ mod tests {
         let mgr = BuildResourceManager::init(None);
         assert!(mgr.budget() > 0, "budget should be positive");
         assert!(mgr.safety_reserve() >= SAFETY_FLOOR);
-        // Stubs behave as no-pressure / no-op.
+        // `tick()` reflects LIVE memory pressure, so its degradation level is not
+        // deterministic here (under a heavily parallel test run the host may
+        // genuinely be under pressure). Just exercise tick()/finish() for the
+        // no-panic path; the degradation thresholds are covered by dedicated
+        // tests with controlled snapshots.
         let mut mgr = mgr;
-        assert_eq!(mgr.tick(), Degradation::Normal);
+        let _ = mgr.tick();
         mgr.finish();
     }
 

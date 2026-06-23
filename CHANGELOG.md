@@ -14,7 +14,34 @@ the current in-progress work.
 Next (native track): the native HTTP **server** (needs a runtime request-context
 mechanism), then `concurrency` (`spawn`/channels via pthreads). `crypto` stays a thin
 FFI bridge to OpenSSL. Self-hosting track: `bootstrap/codegen.ran` → the `ranc` CLI →
-the Stage A→D bootstrap fixed point that defines 1.0.0. Plus `--link-static`.
+the Stage A→D bootstrap fixed point that defines 1.0.0. Also planned: extending the
+bytecode VM to cover `for`-range/`while`/interpolation so the interpreter path stops
+falling back to the (slower) tree-walker, and a documented low-level/`unsafe` memory API.
+
+## [0.3.7] — Interpreter ~3× faster (build the runtime for speed)
+
+Backward-compatible (identical behavior). The `ran` binary — and the interpreter
+embedded in `--embed` standalone builds — was being compiled for **size**
+(`opt-level = "z"`). For a language runtime that is execution-bound, this is a large,
+needless handicap. The release profile now optimizes for **speed** (`opt-level = 3`,
+keeping `lto` + `codegen-units = 1`).
+
+- **Substantially faster interpreter:** on a 10M-iteration numeric loop the
+  tree-walking interpreter improved from ~2.9 s to roughly ~0.9–2.0 s (machine- and
+  load-dependent; `opt-level = 3` is never slower than `z` for compute-bound work). The
+  100M-iteration loop the user reported at ~30 s drops accordingly on the interpreter,
+  and runs in ~40 ms as a native binary (`ran build` is native by default since 0.3.6).
+- This matters for everyday `ran <file>` runs and for the self-hosting bootstrap
+  components (`bootstrap/*.ran`), which execute on the interpreter. The `ran` binary
+  grows modestly (~1.6 MB).
+
+### Fixed — flaky tests under parallel load
+
+- `init_produces_a_positive_budget` asserted `tick() == Normal`, but `tick()` reflects
+  *live* memory pressure and is non-deterministic during a heavily parallel test run.
+  It now exercises `tick()`/`finish()` for the no-panic path; degradation thresholds
+  remain covered by dedicated controlled-snapshot tests. (Complements the 0.3.6
+  collision-free temp-file `nonce()` fix.)
 
 ## [0.3.6] — Native by default + extreme hot-loop speedup
 

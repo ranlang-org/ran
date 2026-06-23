@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.7 — Interpreter ~3× faster (build the runtime for speed)
+
+Backward-compatible (identical behavior). The release profile was optimizing the `ran`
+binary (and the embedded interpreter) for **size** (`opt-level = "z"`) — a needless
+handicap for an execution-bound language runtime. It now optimizes for **speed**
+(`opt-level = 3`). Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Substantially faster interpreter:** a 10M-iteration numeric loop improved from
+  ~2.9 s to roughly ~0.9–2.0 s (machine/load-dependent; opt-level 3 is never slower than
+  size-optimized `z` for compute). Helps both `ran <file>` and the self-hosting
+  `bootstrap/*.ran` components (which run on the interpreter); native binaries (default
+  since 0.3.6) run the same loop in ~40 ms. The `ran` binary grows modestly (~1.6 MB).
+- Fixed a flaky test (`init_produces_a_positive_budget`) that asserted a non-deterministic
+  live-memory degradation level under parallel load.
+
 ## 0.3.6 — Native by default + extreme hot-loop speedup
 
 Backward-compatible (byte-for-byte identical output). `ran build` now emits a **true

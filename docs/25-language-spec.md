@@ -5,7 +5,7 @@ exists so a **second, self-hosted implementation** (`bootstrap/`) can be written
 to match the stage-0 (host) implementation exactly. It describes only what is
 implemented; planned features are listed at the end.
 
-Status: draft for v0.3.6. Where the prose and the implementation disagree, the
+Status: draft for v0.3.7. Where the prose and the implementation disagree, the
 implementation (and its test suite) is authoritative until this document is
 corrected.
 

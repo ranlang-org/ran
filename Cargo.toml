@@ -1,6 +1,6 @@
 [package]
 name = "ran"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 authors = ["Ran Contributors"]
 description = "Ran Programming Language - a self-hosted language for internal systems and business tooling"
@@ -14,7 +14,11 @@ path = "src/main.rs"
 [dependencies]
 
 [profile.release]
-opt-level = "z"
+# Optimize the `ran` binary (and the interpreter/VM embedded in standalone
+# builds) for SPEED, not size. A language runtime is execution-bound, so
+# opt-level 3 (aggressive inlining/vectorization) is worth the larger binary;
+# the user explicitly wants the interpreter to feel fast, close to native.
+opt-level = 3
 lto = true
 strip = true
 # `unwind` (not `abort`) so the HTTP server can catch a faulting request handler
