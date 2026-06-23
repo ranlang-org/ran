@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.6 — Native by default + extreme hot-loop speedup
+
+Backward-compatible (byte-for-byte identical output). `ran build` now emits a **true
+native binary** by default whenever the program fits the native subset (else it falls
+back to the embed-source binary); `--native` still forces native, the new `--embed`
+forces the interpreter-bundled binary. Summary in the root
+[`CHANGELOG.md`](../CHANGELOG.md).
+
+- **Hot-loop speedup ≈7×:** a 100M-iteration numeric loop went from 316 ms to ~43 ms at
+  ~1.7 MB RSS (vs ~30 s / 1 GB on the embed/interpreter binary; Go ≈25 ms, Rust ≈65 ms).
+  Codegen now skips the per-statement string-pool drain for statements that cannot pool
+  a string (so a numeric loop body has no bookkeeping calls), and native builds compile
+  with LTO (`-O2 -flto`) so checked-arithmetic helpers inline.
+- **Native is the default:** programs in the native subset compile straight to machine
+  code with no flag; out-of-subset programs fall back to embed-source automatically.
+- Memory safety preserved: string-producing statements still drain (flat RSS + ASan/
+  UBSan/LSan clean on a 500k-iteration string loop). Decimal money stays exact.
+
 ## 0.3.5 — Native HTTP client (http + https/TLS)
 
 Backward-compatible. `ran build --native` can now build HTTP **client** programs: the

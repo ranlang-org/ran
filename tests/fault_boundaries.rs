@@ -37,10 +37,12 @@ fn tmp_dir() -> PathBuf {
 }
 
 fn nonce() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+    // Collision-free across parallel test binaries: high bits = process id,
+    // low bits = a per-process atomic counter. A bare nanosecond timestamp
+    // could collide across binaries and clobber each other's temp file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    ((std::process::id() as u128) << 64) | (COUNTER.fetch_add(1, Ordering::Relaxed) as u128)
 }
 
 fn stdout(o: &Output) -> String {

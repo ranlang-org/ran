@@ -662,17 +662,28 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     // `--debug`: emit the full artifact dump (./debug/) and a detailed,
     // per-stage build log. Without it, the build is concise with a live spinner.
     let debug = args.iter().any(|a| a == "--debug");
-    // `--native` (alias `--aot`): route to the real native AOT codegen backend
-    // (emit C -> system `cc` -> native ELF). This is additive: the DEFAULT
-    // `ran build` path stays the embed-source `compile_standalone` so existing
-    // behavior and the full test suite are unchanged (the design switches the
-    // default only after the native subset matures).
-    let native = args.iter().any(|a| a == "--native" || a == "--aot");
+    // Native AOT vs embed-source selection:
+    //   * `--native` / `--aot`  : FORCE native codegen (emit C -> system `cc` ->
+    //     native ELF). Out-of-subset constructs are a hard E0606 (no fallback).
+    //   * `--embed`             : FORCE the embed-source standalone (program
+    //     bundled with the interpreter) — for when `cc` is unavailable or you
+    //     explicitly want that path.
+    //   * DEFAULT (no flag)     : AUTO — build native when the program lies in
+    //     the native subset (Go/Rust-class speed, ~1–2 MB binary), else fall
+    //     back to embed-source. Native output is byte-for-byte identical to the
+    //     interpreter, so the automatic choice is safe.
+    let force_native = args.iter().any(|a| a == "--native" || a == "--aot");
+    let force_embed = args.iter().any(|a| a == "--embed" || a == "--embed-source");
     let link_static = args.iter().any(|a| a == "--link-static");
     let args: Vec<String> = args
         .iter()
         .filter(|a| {
-            *a != "--debug" && *a != "--native" && *a != "--aot" && *a != "--link-static"
+            *a != "--debug"
+                && *a != "--native"
+                && *a != "--aot"
+                && *a != "--embed"
+                && *a != "--embed-source"
+                && *a != "--link-static"
         })
         .cloned()
         .collect();
@@ -890,8 +901,18 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     }
 
     // ---- Phase 6: link the standalone binary ----
+    // Decide native vs embed. `--native` forces native; `--embed` forces embed;
+    // otherwise AUTO — native when the program is within the native subset.
+    let native = if force_native {
+        true
+    } else if force_embed {
+        false
+    } else {
+        backend::aot::lower::supported(&checked, &filename).is_ok()
+    };
     let mut spinner;
-    let success;
+    let mut success = false;
+    let mut did_native = false;
     if native {
         // Real native AOT codegen: emit C, compile + link with the system C
         // compiler, produce a genuine native ELF with NO embedded interpreter
@@ -904,15 +925,29 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
             Ok(()) => {
                 if let Some(s) = spinner.take() { s.stop(); }
                 success = true;
+                did_native = true;
             }
             Err(diag) => {
                 if let Some(s) = spinner.take() { s.stop(); }
-                diag.emit(&source);
-                build_mgr.finish();
-                process::exit(1);
+                if force_native {
+                    // The user explicitly asked for native: surface the error.
+                    diag.emit(&source);
+                    build_mgr.finish();
+                    process::exit(1);
+                }
+                // AUTO mode: a native build failed (e.g. no C compiler on this
+                // host). Fall back to the self-contained embed-source binary so
+                // the build still succeeds; note it so the slowdown is visible.
+                eprintln!(
+                    "  \x1b[33mNote\x1b[0m native build unavailable ({}); \
+                     falling back to the embed-source binary. Pass `--native` to \
+                     require native, or install a C compiler for full speed.",
+                    diag.code.as_deref().unwrap_or("E06xx")
+                );
             }
         }
-    } else {
+    }
+    if !did_native {
         build_stage(debug, start, "Finishing", "linking standalone binary (runtime + embedded program)");
         // Live compile animation only around the slow linking phase — all the
         // abort-prone phases (parse/analyze) already ran above with no spinner, so
@@ -950,7 +985,7 @@ fn cmd_build(args: &[String], ownership_mode: OwnershipMode, mem_limit: Option<u
     println!(
         "  \x1b[36m▸ Standalone\x1b[0m runs on another machine with no `ran` install"
     );
-    if native {
+    if did_native {
         println!(
             "  \x1b[32;1m▸ Native\x1b[0m true native binary — no embedded interpreter, no `.ran` source inside"
         );
@@ -1192,7 +1227,7 @@ Thumbs.db
 }
 
 fn cmd_repl() {
-    println!("Ran REPL v0.3.5");
+    println!("Ran REPL v0.3.6");
     println!("Type expressions or statements. Type 'exit' or Ctrl+D to quit.");
     println!();
 
@@ -1283,14 +1318,14 @@ fn cmd_repl() {
 }
 
 fn cmd_version() {
-    println!("ran v0.3.5");
+    println!("ran v0.3.6");
     println!("The Ran Programming Language");
     println!("A self-hosted language for internal systems and business tooling.");
     println!("Engine: bytecode VM (default) with tree-walking interpreter fallback");
 }
 
 fn print_usage() {
-    println!("Ran Programming Language v0.3.5");
+    println!("Ran Programming Language v0.3.6");
     println!();
     println!("Usage:");
     println!("  ran <file.ran>          Run a .ran file");
@@ -1305,6 +1340,11 @@ fn print_usage() {
     println!("Build flags:");
     println!("  ran build -o myapp            Custom output name");
     println!("  ran build src/main.ran -o app Explicit entry + output");
+    println!("  (default)                     Auto: native machine code when the program");
+    println!("                                fits the native subset, else embed-source");
+    println!("  --native | --aot              Force native codegen (E0606 if out of subset)");
+    println!("  --embed                       Force the embed-source binary (bundles the interpreter)");
+    println!("  --link-static                 Static-link native binaries where possible");
     println!();
     println!("Global flags:");
     println!("  --ownership=warn|strict       Ownership/borrow checking mode (default: warn)");

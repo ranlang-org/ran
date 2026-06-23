@@ -11,13 +11,43 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next (native track): the native HTTP **server** — blocked on a runtime request-context
-mechanism (the interpreter injects `req_*`/`query_*`/`param_*`/`cookie_*` as runtime
-globals that zero-arg handlers read by name; native codegen needs an equivalent
-context store before handlers can compile), then `concurrency` (`spawn`/channels via
-pthreads). `crypto` stays a thin FFI bridge to OpenSSL (no hand-rolled crypto).
-Self-hosting track: `bootstrap/codegen.ran` → the `ranc` CLI → the Stage A→D bootstrap
-fixed point that defines 1.0.0. Plus `--link-static` and making native the default.
+Next (native track): the native HTTP **server** (needs a runtime request-context
+mechanism), then `concurrency` (`spawn`/channels via pthreads). `crypto` stays a thin
+FFI bridge to OpenSSL. Self-hosting track: `bootstrap/codegen.ran` → the `ranc` CLI →
+the Stage A→D bootstrap fixed point that defines 1.0.0. Plus `--link-static`.
+
+## [0.3.6] — Native by default + extreme hot-loop speedup
+
+Backward-compatible (output is byte-for-byte identical). Two changes make ordinary Ran
+programs run at native speed without any extra flag:
+
+### Changed — `ran build` is native by default (with safe fallback)
+
+- Plain `ran build` now emits a **true native binary** whenever the program lies within
+  the native subset (functions, control flow, int/float/bool/str, decimal, arrays,
+  structs, maps, match, and the bridged stdlib). Programs outside the subset fall back
+  transparently to the embed-source binary. `--native`/`--aot` still *forces* native
+  (hard `E0606` if unsupported); the new `--embed` forces the interpreter-bundled binary.
+- This is the long-planned "native becomes the default once the subset matures" step.
+  Because native output is verified byte-for-byte equal to the interpreter, the
+  automatic choice changes only speed and binary size, never behavior.
+
+### Fixed — native hot-loop performance (≈7× faster; competitive with Go/Rust)
+
+- A tight numeric loop (`for n in range(1, 100000001) { total = total + n }`) dropped
+  from **316 ms to ~43 ms** and **~1.7 MB RSS** — vs the embed/interpreter binary's
+  ~30 s and 1 GB+ that prompted this work. (Go ≈25 ms, Rust ≈65 ms on the same machine.)
+- Two root causes fixed:
+  1. The per-statement `ran_str_drain` (from the 0.3.4 string-safety work) was emitted
+     even for pure-numeric statements that never allocate a string. Codegen now skips
+     the drain for any statement that provably cannot pool a heap string, so a numeric
+     loop body has **zero** bookkeeping calls. String-producing statements still drain,
+     so memory stays bounded (verified: flat RSS + ASan/UBSan/LSan clean on a 500k-iter
+     string loop).
+  2. Native builds now compile **with LTO** (`-O2 -flto`), so checked-arithmetic helpers
+     (`ran_checked_add`, …) inline into the loop instead of being cross-TU calls.
+- Decimal money is unaffected and still exact (e.g. `0.1 + 0.2 == 0.3`, `100.00 - 99.99
+  == 0.01`, `10/3 == 3.33`), verified byte-for-byte against the interpreter.
 
 ## [0.3.5] — Native HTTP client (http + https/TLS)
 

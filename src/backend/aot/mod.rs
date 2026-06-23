@@ -154,6 +154,8 @@ pub fn compile_native(
     let tmp_out = build_dir.join(format!(".{}.tmp-{}", name, std::process::id()));
     let mut link_cmd = Command::new(&cc);
     link_cmd
+        .arg("-O2")
+        .arg("-flto")
         .arg(&obj_prog)
         .arg(&obj_rt)
         .arg("-o")
@@ -230,6 +232,7 @@ fn compile_object(
 ) -> Result<(), Diagnostic> {
     let mut cmd = Command::new(cc);
     cmd.arg("-O2")
+        .arg("-flto")
         .arg("-std=c11")
         .arg(format!("-I{}", build_dir.display()));
     for d in defines {

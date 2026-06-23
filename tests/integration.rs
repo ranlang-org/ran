@@ -22,10 +22,14 @@ fn run(src: &str) -> Output {
 }
 
 fn nonce() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+    // Collision-free across parallel test binaries: high bits = process id
+    // (unique per test executable), low bits = a per-process atomic counter
+    // (unique per call). A bare nanosecond timestamp could collide when two
+    // binaries run a test in the same instant, clobbering each other's temp
+    // file and flaking an unrelated test.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    ((std::process::id() as u128) << 64) | (COUNTER.fetch_add(1, Ordering::Relaxed) as u128)
 }
 
 fn stdout(o: &Output) -> String {

@@ -1200,6 +1200,35 @@ impl<'a> Emit<'a> {
     fn drain_strings(&mut self, depth: usize) {
         self.line(depth, "ran_str_drain(_sp0);");
     }
+    /// Conservative static test: could evaluating `e` push a heap string onto
+    /// the autorelease pool? Pure scalar arithmetic (the hot path) never does,
+    /// so its statements skip the per-statement `ran_str_drain` entirely — a
+    /// numeric loop body compiles to a tight C loop with no bookkeeping call.
+    /// Anything that might format/concatenate/allocate a string (calls, methods,
+    /// interpolation, string concat) conservatively returns `true`; a missed
+    /// `true` would leak, so every uncertain case errs toward draining.
+    fn expr_may_pool(&self, e: &Expression) -> bool {
+        match e {
+            Expression::IntLiteral(_) | Expression::FloatLiteral(_) | Expression::BoolLiteral(_) => false,
+            Expression::Variable(_) => false,
+            Expression::StringLiteral(s) => has_interpolation(s),
+            Expression::UnaryOp { operand, .. } => self.expr_may_pool(operand),
+            Expression::BinaryOp { left, op, right } => {
+                if matches!(op, BinaryOperator::Add) {
+                    // `+` on a string operand lowers to `ran_concat` (pooled).
+                    if self.infer(left).ok() == Some(CType::Str)
+                        || self.infer(right).ok() == Some(CType::Str)
+                    {
+                        return true;
+                    }
+                }
+                self.expr_may_pool(left) || self.expr_may_pool(right)
+            }
+            // Calls, methods, indexing, field/struct/array/map building, match,
+            // etc. may produce or format strings — drain to be safe.
+            _ => true,
+        }
+    }
 
     // -- Scalar emission: returns inline C code for a scalar-typed expression. --
     fn emit_scalar(&mut self, expr: &Expression, depth: usize) -> Result<(String, CType), Diagnostic> {
@@ -1785,6 +1814,7 @@ impl<'a> Emit<'a> {
         match &stmt.kind {
             Statement::VarDecl { name, value, .. } => {
                 let start = self.tmp;
+                let needs_drain = self.expr_may_pool(value);
                 let ty = self.infer(value)?;
                 if ty == CType::Value {
                     let t = self.emit_value(value, depth)?;
@@ -1799,7 +1829,9 @@ impl<'a> Emit<'a> {
                         }
                     }
                     self.release_range(depth, start, self.tmp);
-                    self.drain_strings(depth);
+                    if needs_drain {
+                        self.drain_strings(depth);
+                    }
                 } else {
                     let (code, sty) = self.emit_scalar(value, depth)?;
                     if sty == CType::Str {
@@ -1838,12 +1870,22 @@ impl<'a> Emit<'a> {
                         }
                     }
                     self.release_range(depth, start, self.tmp);
-                    self.drain_strings(depth);
+                    if needs_drain {
+                        self.drain_strings(depth);
+                    }
                 }
                 Ok(())
             }
             Statement::Echo { expr, escapes } => {
                 let start = self.tmp;
+                // Echo of a bare (non-interpolated) string literal or a string
+                // variable performs no allocation; everything else formats or
+                // concatenates (pooled), so it needs a drain.
+                let needs_drain = match expr {
+                    Expression::StringLiteral(s) => has_interpolation(s),
+                    Expression::Variable(_) if self.infer(expr).ok() == Some(CType::Str) => false,
+                    _ => true,
+                };
                 let built = if let Expression::StringLiteral(s) = expr {
                     build_interpolated(s, &self.scopes)
                 } else {
@@ -1862,18 +1904,23 @@ impl<'a> Emit<'a> {
                     self.line(depth, &format!("ran_echo({});", built));
                 }
                 self.release_range(depth, start, self.tmp);
-                self.drain_strings(depth);
+                if needs_drain {
+                    self.drain_strings(depth);
+                }
                 Ok(())
             }
             Statement::Return(Some(e)) => {
                 let start = self.tmp;
+                let needs_drain = self.expr_may_pool(e);
                 if self.ret_ty == Some(CType::Value) {
                     let t = self.emit_value(e, depth)?;
                     let temps_end = self.tmp;
                     let r = self.fresh_s();
                     self.line(depth, &format!("RanValue {} = ran_clone({});", r, t));
                     self.release_range(depth, start, temps_end);
-                    self.drain_strings(depth);
+                    if needs_drain {
+                        self.drain_strings(depth);
+                    }
                     self.emit_return_cleanup(depth);
                     self.line(depth, &format!("return {};", r));
                 } else {
@@ -1888,7 +1935,9 @@ impl<'a> Emit<'a> {
                         self.line(depth, &format!("{} {} = {};", sty.c_decl(), r, code));
                     }
                     self.release_range(depth, start, temps_end);
-                    self.drain_strings(depth);
+                    if needs_drain {
+                        self.drain_strings(depth);
+                    }
                     self.emit_return_cleanup(depth);
                     self.line(depth, &format!("return {};", r));
                 }
@@ -1896,7 +1945,6 @@ impl<'a> Emit<'a> {
             }
             Statement::Return(None) => {
                 self.emit_return_cleanup(depth);
-                self.drain_strings(depth);
                 if self.is_main {
                     self.line(depth, "return 0;");
                 } else {
@@ -1906,13 +1954,11 @@ impl<'a> Emit<'a> {
             }
             Statement::Break => {
                 self.emit_loop_cleanup(depth);
-                self.drain_strings(depth);
                 self.line(depth, "break;");
                 Ok(())
             }
             Statement::Continue => {
                 self.emit_loop_cleanup(depth);
-                self.drain_strings(depth);
                 self.line(depth, "continue;");
                 Ok(())
             }
@@ -1950,6 +1996,7 @@ impl<'a> Emit<'a> {
                     return Ok(());
                 }
                 let start = self.tmp;
+                let needs_drain = self.expr_may_pool(e);
                 let ty = self.infer(e)?;
                 if ty == CType::Value {
                     let t = self.emit_value(e, depth)?;
@@ -1959,17 +2006,22 @@ impl<'a> Emit<'a> {
                     self.line(depth, &format!("(void)({});", code));
                 }
                 self.release_range(depth, start, self.tmp);
-                self.drain_strings(depth);
+                if needs_drain {
+                    self.drain_strings(depth);
+                }
                 Ok(())
             }
             Statement::If { condition, then_body, else_body } => {
                 let start = self.tmp;
+                let needs_drain = self.expr_may_pool(condition);
                 let cond = self.emit_condition(condition, depth)?;
                 let cend = self.tmp;
                 let cv = self.fresh_s();
                 self.line(depth, &format!("bool {} = {};", cv, cond));
                 self.release_range(depth, start, cend);
-                self.drain_strings(depth);
+                if needs_drain {
+                    self.drain_strings(depth);
+                }
                 self.line(depth, &format!("if ({}) {{", cv));
                 self.scopes.push();
                 self.emit_block(then_body, depth + 1)?;
@@ -1986,12 +2038,15 @@ impl<'a> Emit<'a> {
             Statement::While { condition, body } => {
                 self.line(depth, "while (1) {");
                 let start = self.tmp;
+                let needs_drain = self.expr_may_pool(condition);
                 let cond = self.emit_condition(condition, depth + 1)?;
                 let cend = self.tmp;
                 let cv = self.fresh_s();
                 self.line(depth + 1, &format!("bool {} = {};", cv, cond));
                 self.release_range(depth + 1, start, cend);
-                self.drain_strings(depth + 1);
+                if needs_drain {
+                    self.drain_strings(depth + 1);
+                }
                 self.line(depth + 1, &format!("if (!{}) break;", cv));
                 self.scopes.push();
                 self.loop_marks.push(self.scopes.stack.len() - 1);
@@ -2009,6 +2064,8 @@ impl<'a> Emit<'a> {
                     _ => return Err(codegen_err(self.file, 0, 0, "for iterable is not range(...)")),
                 };
                 let bstart = self.tmp;
+                let needs_drain = start_expr.map(|e| self.expr_may_pool(e)).unwrap_or(false)
+                    || self.expr_may_pool(end_expr);
                 let startcode = match start_expr {
                     Some(e) => self.emit_scalar(e, depth)?.0,
                     None => "INT64_C(0)".to_string(),
@@ -2020,7 +2077,9 @@ impl<'a> Emit<'a> {
                 self.line(depth, &format!("int64_t {} = {};", sa, startcode));
                 self.line(depth, &format!("int64_t {} = {};", sb, endcode));
                 self.release_range(depth, bstart, bend);
-                self.drain_strings(depth);
+                if needs_drain {
+                    self.drain_strings(depth);
+                }
                 let cv = c_ident(variable);
                 self.line(
                     depth,
@@ -2066,7 +2125,9 @@ impl<'a> Emit<'a> {
             self.line(depth, &format!("{} {} = {};", sty.c_decl(), subj, code));
         }
         self.release_range(depth, start, self.tmp);
-        self.drain_strings(depth);
+        if self.expr_may_pool(subject) {
+            self.drain_strings(depth);
+        }
         self.emit_arms(arms, &subj, sty, depth)?;
         self.scope_pop(depth);
         Ok(())
