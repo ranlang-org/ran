@@ -1227,7 +1227,7 @@ Thumbs.db
 }
 
 fn cmd_repl() {
-    println!("Ran REPL v0.3.10");
+    println!("Ran REPL v0.3.11");
     println!("Type expressions or statements. Type 'exit' or Ctrl+D to quit.");
     println!();
 
@@ -1318,14 +1318,14 @@ fn cmd_repl() {
 }
 
 fn cmd_version() {
-    println!("ran v0.3.10");
+    println!("ran v0.3.11");
     println!("The Ran Programming Language");
     println!("A self-hosted language for internal systems and business tooling.");
     println!("Engine: bytecode VM (default) with tree-walking interpreter fallback");
 }
 
 fn print_usage() {
-    println!("Ran Programming Language v0.3.10");
+    println!("Ran Programming Language v0.3.11");
     println!();
     println!("Usage:");
     println!("  ran <file.ran>          Run a .ran file");

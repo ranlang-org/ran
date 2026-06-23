@@ -11,9 +11,32 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next: request #3 (COBOL-grade business-logic stdlib beyond decimal), the
-beginner-friendly safe-pointer / `unsafe` model (#4), and the self-hosting
+Next: the beginner-friendly safe-pointer / `unsafe` model (#4), and the self-hosting
 `bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0 (#5).
+
+## [0.3.11] — COBOL-grade business helpers for `decimal`
+
+Backward-compatible (additive). Beyond exact arithmetic, the `decimal` module now
+covers the formatted, fixed-precision, batch-total behaviour that mainframe/COBOL
+financial code is prized for — all exact, all on the existing
+no-silent-overflow / no-divide-by-zero guarantees (request #3).
+
+### Added — `decimal` business helpers
+
+- `decimal.format(a, decimals?, thousands?, point?)` — PICTURE-style formatted string
+  with grouped thousands. Defaults to 2 places, `,` group, `.` point (US); pass
+  `(".", ",")` for EU. Negative and integer (`decimals = 0`) forms handled.
+- `decimal.to_fixed(a, scale?, mode?)` — pin to exactly `scale` places (default 2,
+  half-up): the canonical "fix to cents" (like a COBOL fixed `PIC 9(n)V9(m)`).
+- `decimal.sum(array)` — exact running total of a list of decimals (batch totals).
+- `decimal.min(a, b)` / `decimal.max(a, b)` — exact ordered selection.
+- `decimal.percent(a, pct)` — `a * pct / 100`, kept exact (apply `to_fixed` to pin).
+- All six rounding modes remain available on `round`/`div`/`to_fixed`: `half_up`
+  (COBOL `ROUNDED`), `half_even`/`bankers`, `down`/`truncate`, `up`, `floor`, `ceiling`.
+
+`Decimal::format` + thousands grouping live in `src/support/decimal.rs` (reusable);
+the methods are wired into the interpreter's `decimal` dispatch and documented in
+`docs/stdlib/decimal.md`.
 
 ## [0.3.10] — Unused-binding & unused-import lints (W0601 / W0602)
 

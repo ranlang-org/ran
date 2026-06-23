@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.11 — COBOL-grade business helpers for `decimal`
+
+Backward-compatible (additive). The `decimal` module gains the formatted,
+fixed-precision, batch-total behaviour COBOL financial code relies on, all exact
+(request #3). Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- `decimal.format(a, decimals?, thousands?, point?)` — PICTURE-style grouped output
+  (US default `1,234,567.50`; EU `(".", ",")` → `1.234.567,50`).
+- `decimal.to_fixed(a, scale?, mode?)` — pin to exactly `scale` places (fix to cents).
+- `decimal.sum(array)` — exact batch total; `decimal.min`/`max`; `decimal.percent`.
+- All six rounding modes on `round`/`div`/`to_fixed` (`half_up`, `bankers`/`half_even`,
+  `down`, `up`, `floor`, `ceiling`). Documented in `docs/stdlib/decimal.md`.
+
 ## 0.3.10 — Unused-binding & unused-import lints (W0601 / W0602)
 
 Backward-compatible (warnings, never fatal). Completes the strict-analyzer track

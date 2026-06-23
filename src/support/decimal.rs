@@ -287,6 +287,61 @@ fn apply_rounding(q: i128, r: i128, factor: i128, mode: Rounding) -> i128 {
     }
 }
 
+/// Group an unsigned digit string into thousands with `sep` (e.g. "1234567"
+/// -> "1,234,567"). An empty separator returns the digits unchanged.
+fn group_thousands(digits: &str, sep: &str) -> String {
+    if sep.is_empty() || digits.len() <= 3 {
+        return digits.to_string();
+    }
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push_str(sep);
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl Decimal {
+    /// COBOL PICTURE-style fixed formatting for money / business output.
+    ///
+    /// Rescales to exactly `decimals` fractional places (rounding **half-up**,
+    /// the conventional `ROUNDED` behaviour), groups the integer part in threes
+    /// with `thousands`, and joins the fraction with `point`. Examples:
+    ///   `format(2, ",", ".")` on `1234567.5`  -> `"1,234,567.50"` (US)
+    ///   `format(2, ".", ",")` on `1234567.5`  -> `"1.234.567,50"` (EU)
+    ///   `format(0, ",", ".")` on `-1234`      -> `"-1,234"`
+    pub fn format(&self, decimals: u32, thousands: &str, point: &str) -> String {
+        let scaled = self.rescale(decimals, Rounding::HalfUp).unwrap_or(*self);
+        let neg = scaled.mantissa < 0 && scaled.mantissa != 0;
+        let digits = scaled.mantissa.unsigned_abs().to_string();
+        let scale = decimals as usize;
+
+        let (int_str, frac_str) = if scale == 0 {
+            (digits.as_str().to_string(), String::new())
+        } else if digits.len() <= scale {
+            let zeros = "0".repeat(scale - digits.len());
+            ("0".to_string(), format!("{}{}", zeros, digits))
+        } else {
+            let split = digits.len() - scale;
+            (digits[..split].to_string(), digits[split..].to_string())
+        };
+
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        out.push_str(&group_thousands(&int_str, thousands));
+        if scale > 0 {
+            out.push_str(point);
+            out.push_str(&frac_str);
+        }
+        out
+    }
+}
+
 impl fmt::Display for Decimal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.scale == 0 {

@@ -58,6 +58,42 @@ are never a surprise.
 | `a.scale()` | Number of fractional digits |
 | `a.to_str()` | String form |
 | `a.to_int()` | Truncate to int |
+
+## COBOL-grade business helpers
+
+These give the formatted, fixed, batch-total behaviour that mainframe/COBOL
+financial code relies on — all exact, all built on the guarantees below.
+
+| Function | Description |
+|----------|-------------|
+| `decimal.to_fixed(a, scale, mode?)` | Pin to exactly `scale` places (default 2, half-up). The canonical way to fix a money value to cents — like a COBOL fixed `PIC 9(n)V9(m)`. |
+| `decimal.format(a, decimals?, thousands?, point?)` | PICTURE-style formatted string with grouped thousands. Defaults: 2 places, `,` group, `.` point (US). For EU pass `(".", ",")`. |
+| `decimal.sum(array)` | Exact running total of a list of decimals (batch totals). |
+| `decimal.min(a, b)` / `decimal.max(a, b)` | Exact ordered selection. |
+| `decimal.percent(a, pct)` | `a * pct / 100`, kept exact; apply `to_fixed(.., 2)` to pin to cents (tax/interest). |
+
+```ran
+import "std::decimal" as decimal
+import "std::str" as str
+fn main() {
+    let amount = dec("1234567.5")
+    echo decimal.format(amount, 2)                # 1,234,567.50  (US)
+    echo decimal.format(amount, 2, ".", ",")      # 1.234.567,50  (EU)
+
+    let lines = [dec("19.99"), dec("5.00"), dec("0.01")]
+    echo str.from(decimal.sum(lines))             # 25.00
+
+    let tax = decimal.to_fixed(decimal.percent(dec("100.00"), dec("8.25")), 2)
+    echo str.from(tax)                            # 8.25
+
+    echo str.from(decimal.round(dec("2.5"), 0, "bankers"))   # 2 (banker's)
+}
+```
+
+**Rounding modes** (the `mode` argument, case-insensitive): `half_up` (default,
+COBOL `ROUNDED`), `half_even`/`bankers` (reduces cumulative bias), `down`/`truncate`,
+`up`, `floor`, `ceiling`.
+
 | `a.to_float()` | Convert to float (lossy — avoid for money) |
 
 ## Rounding modes

@@ -685,6 +685,72 @@ impl Environment {
             ("decimal", "neg") => Value::Decimal(self.decimal_arg(args, 0).neg()),
             ("decimal", "is_zero") => Value::Bool(self.decimal_arg(args, 0).is_zero()),
 
+            // --- COBOL-grade business helpers (R: exact money math) ----------
+            // decimal.to_fixed(a, scale, mode?): rescale to a fixed number of
+            // decimal places (COBOL fixed PIC 9..V9..), rounding half-up by
+            // default. The canonical way to pin a money value to 2 places.
+            ("decimal", "to_fixed") => {
+                let a = self.decimal_arg(args, 0);
+                let scale = self.eval_arg_int(args, 1, 2).max(0) as u32;
+                let mode = Rounding::from_name(&self.eval_arg_str(args, 2, "half_up"));
+                match a.rescale(scale, mode) {
+                    Ok(d) => Value::Decimal(d),
+                    Err(e) => runtime_error("E1003", &e, "reduce the scale"),
+                }
+            }
+            // decimal.format(a, decimals?, thousands?, point?): PICTURE-style
+            // fixed formatting with grouped thousands. Defaults: 2 places, ","
+            // group, "." point (US). For EU pass ("." , ",").
+            ("decimal", "format") => {
+                let a = self.decimal_arg(args, 0);
+                let decimals = self.eval_arg_int(args, 1, 2).max(0) as u32;
+                let thousands = self.eval_arg_str(args, 2, ",");
+                let point = self.eval_arg_str(args, 3, ".");
+                Value::Str(a.format(decimals, &thousands, &point))
+            }
+            // decimal.sum(array): exact running total of a list of money values
+            // (batch totals — a COBOL staple). Empty/non-array -> 0.
+            ("decimal", "sum") => {
+                let arr = self.eval_arg_val(args, 0);
+                let mut acc = crate::support::decimal::Decimal::zero();
+                if let Value::Array(items) = arr {
+                    for it in items {
+                        if let Some(d) = Self::to_decimal(&it) {
+                            match acc.add(&d) {
+                                Ok(s) => acc = s,
+                                Err(e) => runtime_error("E1003", &e, "totals exceed decimal range; split the batch"),
+                            }
+                        }
+                    }
+                }
+                Value::Decimal(acc)
+            }
+            // decimal.min(a, b) / decimal.max(a, b): exact ordered selection.
+            ("decimal", "min") => {
+                let a = self.decimal_arg(args, 0);
+                let b = self.decimal_arg(args, 1);
+                Value::Decimal(if a.cmp(&b) == std::cmp::Ordering::Greater { b } else { a })
+            }
+            ("decimal", "max") => {
+                let a = self.decimal_arg(args, 0);
+                let b = self.decimal_arg(args, 1);
+                Value::Decimal(if a.cmp(&b) == std::cmp::Ordering::Less { b } else { a })
+            }
+            // decimal.percent(a, pct): a * pct / 100, kept exact at a generous
+            // scale then caller can to_fixed(...) — handy for tax/interest.
+            ("decimal", "percent") => {
+                let a = self.decimal_arg(args, 0);
+                let pct = self.decimal_arg(args, 1);
+                let hundred = crate::support::decimal::Decimal::from_int(100);
+                match a.mul(&pct).and_then(|p| {
+                    let scale = p.scale().max(2);
+                    p.div(&hundred, scale, Rounding::HalfUp)
+                }) {
+                    Ok(d) => Value::Decimal(d),
+                    Err(e) => runtime_error("E1003", &e, "reduce operand size or scale"),
+                }
+            }
+
             // --- CONCURRENCY (channels: bounded + rendezvous) ----------------
             // chan(capacity) -> handle. capacity 0 => rendezvous (R11.1, R11.6).
             ("concurrency", "chan") => {

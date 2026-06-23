@@ -43,6 +43,35 @@ fn code(o: &Output) -> i32 {
 }
 
 #[test]
+fn decimal_cobol_money_helpers() {
+    // COBOL-grade business helpers: PICTURE-style formatting, fixed rescale,
+    // exact batch sum, min/max, percent, and banker's rounding — all exact.
+    let out = run(r#"
+import "std::decimal" as decimal
+import "std::str" as str
+fn main() {
+    echo decimal.format(dec("1234567.5"), 2)
+    echo decimal.format(dec("1234567.5"), 2, ".", ",")
+    echo decimal.format(dec("-1234"), 0)
+    echo str.from(decimal.to_fixed(dec("19.996"), 2))
+    echo str.from(decimal.sum([dec("19.99"), dec("5.00"), dec("0.01")]))
+    echo str.from(decimal.to_fixed(decimal.percent(dec("100.00"), dec("8.25")), 2))
+    echo str.from(decimal.round(dec("2.5"), 0, "bankers"))
+}
+"#);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    let lines: Vec<&str> = s.lines().collect();
+    assert_eq!(lines[0], "1,234,567.50");
+    assert_eq!(lines[1], "1.234.567,50");
+    assert_eq!(lines[2], "-1,234");
+    assert_eq!(lines[3], "20.00");
+    assert_eq!(lines[4], "25.00");
+    assert_eq!(lines[5], "8.25");
+    assert_eq!(lines[6], "2");
+}
+
+#[test]
 fn unused_variable_and_import_warn_but_run() {
     // Unused `let`/`var` and unused imports are warnings (W0601/W0602): the
     // program still runs (exit 0), but the diagnostics appear on stderr.
