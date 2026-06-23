@@ -302,6 +302,7 @@ impl BytecodeCompiler {
             Statement::VarDecl {
                 name,
                 mutable: _,
+                is_decl: _,
                 type_annotation,
                 value,
             } => self.compile_var_decl(name, type_annotation, value),

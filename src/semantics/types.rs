@@ -1744,6 +1744,7 @@ mod tests {
         stmt(Statement::VarDecl {
             name: name.into(),
             mutable,
+            is_decl: true,
             type_annotation: None,
             value,
         })
@@ -2493,6 +2494,7 @@ mod ownership_soundness_property {
         stmt(Statement::VarDecl {
             name: name.into(),
             mutable,
+            is_decl: true,
             type_annotation: None,
             value,
         })

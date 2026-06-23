@@ -2976,6 +2976,7 @@ mod memory_release_property {
             out.push(stmt(Statement::VarDecl {
                 name: format!("b{}", *ctr),
                 mutable: false,
+                is_decl: true,
                 type_annotation: None,
                 value: binding_value(i),
             }));

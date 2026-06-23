@@ -720,6 +720,7 @@ mod ownership_mode_tests {
         stmt(Statement::VarDecl {
             name: name.into(),
             mutable: false,
+            is_decl: true,
             type_annotation: None,
             value,
         })

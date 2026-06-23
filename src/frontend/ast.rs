@@ -36,10 +36,17 @@ pub struct Program {
 /// Top-level statements
 #[derive(Debug, Clone)]
 pub enum Statement {
-    /// Variable assignment: name="value" or let name = value
+    /// Variable declaration or assignment.
+    /// * `let x = v`           -> is_decl=true,  mutable=false (immutable binding)
+    /// * `var x = v` / `let mut x = v` -> is_decl=true, mutable=true
+    /// * `x = v` (bare/shell)  -> is_decl=false (declare-or-assign; mutable when
+    ///   it introduces a new binding). `is_decl=false` lets the analyzer tell a
+    ///   reassignment from a fresh declaration so it can reject a write to an
+    ///   immutable `let` binding (E0100).
     VarDecl {
         name: String,
         mutable: bool,
+        is_decl: bool,
         type_annotation: Option<TypeExpr>,
         value: Expression,
     },

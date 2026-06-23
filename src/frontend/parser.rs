@@ -217,6 +217,7 @@ impl Parser {
         Statement::VarDecl {
             name,
             mutable,
+            is_decl: true,
             type_annotation,
             value,
         }
@@ -241,6 +242,7 @@ impl Parser {
         Statement::VarDecl {
             name,
             mutable: true,
+            is_decl: true,
             type_annotation,
             value,
         }
@@ -254,6 +256,7 @@ impl Parser {
         Statement::VarDecl {
             name,
             mutable: true,
+            is_decl: false,
             type_annotation: None,
             value,
         }
