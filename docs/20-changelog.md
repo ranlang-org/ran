@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.10 — Unused-binding & unused-import lints (W0601 / W0602)
+
+Backward-compatible (warnings, never fatal). Completes the strict-analyzer track
+(request #2). Summary in the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **`W0601`** unused variable — an explicit `let`/`var`/`let mut` never read (prefix
+  with `_` to silence). **`W0602`** unused import — an alias never referenced.
+- No false positives: uses are collected program-wide and include interpolation reads
+  (`"$x"`), method receivers, field/index bases, closures, and match arms.
+- Small dedicated module `src/semantics/unused.rs`; runs only on otherwise-clean
+  programs. The three `bootstrap/*.ran` components are warning-clean.
+
 ## 0.3.9 — `let` is enforced immutable (E0100)
 
 Backward-compatible in practice (nothing in the test suite or `bootstrap/*.ran`

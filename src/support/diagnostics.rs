@@ -287,6 +287,15 @@ impl DiagnosticEngine {
             .filter(|d| d.severity >= Severity::Error)
             .count()
     }
+
+    /// Number of stored `Warning`-severity diagnostics (used to decide whether
+    /// to flush warnings on an otherwise-clean build).
+    pub fn warning_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count()
+    }
 }
 
 /// Emit syntax diagnostics (from the lexer/parser) and abort the process if any

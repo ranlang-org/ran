@@ -23,7 +23,7 @@ cp target/release/ran ~/.local/bin/
 
 ```bash
 ran version
-# ran v0.3.9
+# ran v0.3.10
 # The Ran Programming Language
 # A self-hosted language for internal systems and business tooling.
 # Engine: bytecode VM (default) with tree-walking interpreter fallback
@@ -145,7 +145,7 @@ For quick experiments, start the interactive REPL:
 
 ```bash
 ran repl
-# Ran REPL v0.3.9
+# Ran REPL v0.3.10
 # Type expressions or statements. Type 'exit' or Ctrl+D to quit.
 ```
 

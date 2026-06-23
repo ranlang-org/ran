@@ -43,6 +43,29 @@ fn code(o: &Output) -> i32 {
 }
 
 #[test]
+fn unused_variable_and_import_warn_but_run() {
+    // Unused `let`/`var` and unused imports are warnings (W0601/W0602): the
+    // program still runs (exit 0), but the diagnostics appear on stderr.
+    let out = run(r#"
+import "std::time" as unused_mod
+fn main() {
+    let dead = 10
+    let live = 5
+    let _ignored = 1
+    echo "live = $live"
+}
+"#);
+    assert_eq!(code(&out), 0, "unused lints must not be fatal: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "live = 5");
+    let err = stderr(&out);
+    assert!(err.contains("W0601"), "expected unused-variable warning: {}", err);
+    assert!(err.contains("dead"), "should name `dead`: {}", err);
+    assert!(err.contains("W0602"), "expected unused-import warning: {}", err);
+    assert!(!err.contains("live"), "`live` is used (interp), must not warn: {}", err);
+    assert!(!err.contains("_ignored"), "`_`-prefixed must be silent: {}", err);
+}
+
+#[test]
 fn let_is_immutable_var_is_mutable() {
     // Reassigning a `let` binding is the hard error E0100 (even in default mode).
     let out = run(r#"

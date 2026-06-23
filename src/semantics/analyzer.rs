@@ -5,6 +5,7 @@
 use crate::frontend::ast::{Expression, Param, Program, Span, Statement, Stmt, TypeExpr};
 use crate::support::diagnostics::{Diagnostic, DiagnosticEngine, Severity, SourceLoc};
 use crate::semantics::types::{OwnershipFinding, TypeChecker};
+use crate::semantics::unused;
 
 use std::collections::HashSet;
 use std::process;
@@ -296,6 +297,17 @@ pub fn analyze_with_file(
         process::exit(1);
     }
 
+    // Unused-binding / unused-import lints (Rust-style warnings). Only on an
+    // otherwise-clean program, so error output stays focused. Warnings, never
+    // fatal — `let`-immutability etc. already aborted above if violated.
+    unused::check_unused(&program.statements, &filename_owned, &mut diag);
+
+    // Flush accumulated warnings (unused bindings/imports + warn-mode ownership
+    // findings) exactly once — `emit_all` is not idempotent.
+    if diag.warning_count() > 0 {
+        diag.emit_all();
+    }
+
     // Warn-mode migration readiness summary (task 7.4). Only in `warn` mode and
     // only on a clean (no hard error) build — in `strict` mode the findings are
     // errors and we already aborted above, so strict behavior is untouched.
@@ -309,7 +321,7 @@ pub fn analyze_with_file(
         let mut_sites = count_mut_ref_param_sites(program);
         let total_findings: usize = counts.iter().map(|(_, n)| *n).sum();
         if total_findings > 0 || mut_sites > 0 {
-            diag.emit_all();
+            // (warnings already flushed above)
             eprintln!("{}", format_ownership_summary(&counts, mut_sites));
             if total_findings == 0 {
                 eprintln!(

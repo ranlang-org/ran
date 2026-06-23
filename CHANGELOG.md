@@ -11,12 +11,27 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next: the rest of the strictness track — unused-variable / unused-import diagnostics
-(Rust-style warnings); then the COBOL-grade business-logic stdlib (beyond decimal),
-the beginner-friendly safe-pointer / `unsafe` model, and the self-hosting
-`bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0. (When writing the
-self-hosting sources, keep each file ≤ ~1.5K lines and functions short-but-complete for
-maintainability.)
+Next: request #3 (COBOL-grade business-logic stdlib beyond decimal), the
+beginner-friendly safe-pointer / `unsafe` model (#4), and the self-hosting
+`bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0 (#5).
+
+## [0.3.10] — Unused-binding & unused-import lints (W0601 / W0602)
+
+Backward-compatible (warnings, never fatal). Completes the strict-analyzer track
+(request #2): on top of `let`-immutability (E0100, 0.3.9), the analyzer now flags
+dead code Rust-style.
+
+- **`W0601` — unused variable:** an explicit `let` / `var` / `let mut` declaration whose
+  name is never read anywhere in the program. Prefix with `_` (e.g. `_tmp`) to silence.
+- **`W0602` — unused import:** an `import "…" as alias` whose alias is never referenced.
+- **No false positives by construction:** the use-set is collected program-wide and
+  includes names read inside interpolated strings (`"$x"`, `"${time.now_ms()}"`), method
+  receivers, field/index bases, closures, and match arms — so a name used *anywhere* is
+  never flagged (at worst a duplicate name across scopes yields a safe miss). Bare
+  shell-style `x = …` assignments are not treated as declarations.
+- Lives in a small dedicated module (`src/semantics/unused.rs`) and runs only on an
+  otherwise-clean program, so error output stays focused. Verified: the three
+  `bootstrap/*.ran` components are warning-clean; full suite green.
 
 ## [0.3.9] — `let` is enforced immutable (E0100)
 
