@@ -292,6 +292,13 @@ pub struct Binding {
     pub name: String,
     pub ran_type: RanType,
     pub mutable: bool,
+    /// True only for a binding introduced by an immutable `let x = …`
+    /// declaration. Distinguishes it from other immutable-`mutable=false`
+    /// bindings (parameters, `for` variables, `match` bindings) so that
+    /// reassigning ONLY a `let` binding is the immutability error (E0100);
+    /// `let mut`, `var`, bare `x = …`, params, and loop/match bindings are all
+    /// freely assignable.
+    pub let_locked: bool,
     pub ownership: OwnershipState,
     /// Where the value was moved from. `Some(span)` iff `ownership == Moved`.
     pub moved_at: Option<Span>,
@@ -306,10 +313,21 @@ impl Binding {
             name,
             ran_type,
             mutable,
+            let_locked: false,
             ownership: OwnershipState::Owned,
             moved_at: None,
             borrows: BorrowSet::new(),
         }
+    }
+
+    /// An immutable `let` binding (reassignment is E0100). Like [`owned`] with
+    /// `mutable = false`, but flagged so the analyzer can tell it apart from a
+    /// parameter / loop / match binding (which are also `mutable = false` but
+    /// may be reassigned).
+    pub fn let_immutable(name: String, ran_type: RanType) -> Self {
+        let mut b = Self::owned(name, ran_type, false);
+        b.let_locked = true;
+        b
     }
 
     /// Whether this binding is a `Copy`-typed value (not subject to moves).
@@ -502,6 +520,12 @@ pub struct OwnershipFinding {
     pub message: String,
     /// Optional refined fix hint; falls back to the catalog hint when `None`.
     pub help: Option<String>,
+    /// When true, this finding is ALWAYS an error and is never downgraded to a
+    /// warning by `--ownership=warn`. Used for hard semantic errors that happen
+    /// to flow through the ownership funnel, e.g. assigning to an immutable
+    /// `let` binding (E0100) — choosing `let` is opting into immutability, so a
+    /// write is rejected regardless of the ownership migration mode.
+    pub always_error: bool,
 }
 
 /// Type checker - verifies types and ownership rules
@@ -565,6 +589,26 @@ impl TypeChecker {
             span,
             message,
             help,
+            always_error: false,
+        });
+    }
+
+    /// Emit a coded finding that is ALWAYS an error (never downgraded by
+    /// `--ownership=warn`). For hard semantic errors routed through the
+    /// ownership funnel, e.g. assigning to an immutable `let` binding (E0100).
+    pub fn emit_hard_coded(
+        &mut self,
+        code: &'static str,
+        span: Span,
+        message: String,
+        help: Option<String>,
+    ) {
+        self.ownership_findings.push(OwnershipFinding {
+            code,
+            span,
+            message,
+            help,
+            always_error: true,
         });
     }
 
@@ -585,6 +629,7 @@ impl TypeChecker {
             Statement::VarDecl {
                 name,
                 mutable,
+                is_decl,
                 value,
                 ..
             } => {
@@ -606,7 +651,42 @@ impl TypeChecker {
                 //    real violations inside them are still checked (R8.7).
                 self.check_inner_bodies(value, scope, sp);
                 let inferred_type = self.infer_type(value, scope);
-                scope.define(Binding::owned(name.clone(), inferred_type, *mutable));
+
+                if *is_decl {
+                    // Explicit declaration: `let`/`let mut`/`var`. Shadows any
+                    // prior binding of the same name. A plain `let` (immutable)
+                    // is reassignment-locked; `let mut`/`var` are not.
+                    let binding = if *mutable {
+                        Binding::owned(name.clone(), inferred_type, true)
+                    } else {
+                        Binding::let_immutable(name.clone(), inferred_type)
+                    };
+                    scope.define(binding);
+                } else {
+                    // Bare `x = …` (shell-style): assignment when the binding
+                    // already exists, else a fresh mutable declaration. Writing
+                    // to an immutable `let` binding is the hard error E0100.
+                    let locked = scope.lookup(name).map(|b| b.let_locked);
+                    match locked {
+                        Some(true) => {
+                            self.emit_hard_coded(
+                                "E0100",
+                                sp,
+                                format!("cannot assign to immutable `let` binding `{}`", name),
+                                Some(format!(
+                                    "`{name}` was declared with `let`, which is immutable. \
+                                     Declare it with `var {name} = …` (relaxed) or \
+                                     `let mut {name} = …` (explicitly mutable) to allow reassignment.",
+                                    name = name
+                                )),
+                            );
+                        }
+                        Some(false) => { /* mutable binding: ordinary reassignment */ }
+                        None => {
+                            scope.define(Binding::owned(name.clone(), inferred_type, true));
+                        }
+                    }
+                }
             }
 
             Statement::FnDecl { name, params, body, .. } => {

@@ -139,6 +139,7 @@ pub fn analyze_with_file(
         // Use a label phrased for the specific ownership/borrow violation so
         // the rendered diagnostic reads correctly for moves *and* borrows.
         let label_text = match finding.code {
+            "E0100" => "assignment to immutable `let` binding",
             "E0210" => "value used here after move",
             "E0212" => "conflicting borrow occurs here",
             "E0214" => "reference to local value returned here",
@@ -152,7 +153,9 @@ pub fn analyze_with_file(
         if let Some(help) = &finding.help {
             d = d.with_help(help.clone());
         }
-        if downgrade {
+        // `always_error` findings (e.g. E0100 immutable-assignment) stay errors
+        // even in `--ownership=warn`; the rest follow the migration mode.
+        if downgrade && !finding.always_error {
             d.severity = Severity::Warning;
         }
         diag.report(d);

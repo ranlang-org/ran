@@ -11,12 +11,34 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next: continuing the language-ergonomics + strictness track — enforce `let`
-immutability and add Rust-style unused-variable / unused-import diagnostics (request
-to make the analyzer "super strict"); mature the COBOL-grade business-logic stdlib
-beyond decimal; a beginner-friendly safe pointer/`unsafe` memory model; widen the
-bytecode VM so the interpreter path stops falling back to the tree-walker; and the
-self-hosting `bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0.
+Next: the rest of the strictness track — unused-variable / unused-import diagnostics
+(Rust-style warnings); then the COBOL-grade business-logic stdlib (beyond decimal),
+the beginner-friendly safe-pointer / `unsafe` model, and the self-hosting
+`bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0. (When writing the
+self-hosting sources, keep each file ≤ ~1.5K lines and functions short-but-complete for
+maintainability.)
+
+## [0.3.9] — `let` is enforced immutable (E0100)
+
+Backward-compatible in practice (no test or `bootstrap/*.ran` source reassigns a `let`).
+This sharpens Ran's three declaration forms into a clear, Rust-grade contract:
+
+- **`let x = …`** — immutable. Reassigning it is a hard error **`error[E0100]`** (with
+  `file:line:col` + a fix hint), enforced in *every* mode (choosing `let` is opting into
+  immutability), not just `--ownership=strict`.
+- **`let mut x = …`** — explicitly mutable.
+- **`var x = …`** — the flexible everyday form (mutable, no fuss).
+- **bare `x = …`** — shell-style mutable declare/assign.
+- Function parameters, `for` variables, and `match` bindings remain freely assignable —
+  only an explicit immutable `let` is locked (a new `Binding.let_locked` flag
+  distinguishes it from other `mutable = false` bindings, so common imperative code and
+  the bootstrap are unaffected).
+
+Also documents the single **`int`** type: no `int8/16/32/64` to choose — one 64-bit
+`int` with overflow protection (`E1010`), and `decimal` for exact/large values.
+
+Verified: E0100 fires on `let` reassignment and aborts; `var`/`let mut`/params/loops
+stay free; the three `bootstrap/*.ran` components run clean; full suite green.
 
 ## [0.3.8] — Lighter syntax: `var` (Go-style mutable)
 

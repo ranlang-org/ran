@@ -5,47 +5,60 @@ best; you can mix them freely.
 
 ## Declaring variables
 
-### `var` — mutable (recommended, Go-style)
+Ran has three declaration forms. The rule of thumb: reach for **`var`** unless you
+specifically want a guarantee.
 
-Use `var` when a value will change. It is the everyday form and reads cleanly:
+### `var` — flexible (the everyday form)
+
+`var` declares a binding you can reassign freely. Use it when you don't want to think
+about whether the value will change — it just works:
 
 ```ran
 var total = 0
 var name = "Alice"
-var price: decimal = dec("19.99")   # optional type annotation
-total = total + 5                   # reassign freely
+total = total + 5      # fine
 ```
 
-### `let` — immutable
+### `let` — immutable (enforced)
 
-Use `let` for a value that should never change after it is set. (Reassigning a `let`
-binding is reported by the strict analyzer — `let` means "constant".)
+`let` declares a binding that must never change. Reassigning it is a hard compile error
+(`E0100`) — this is one of Ran's strictness guarantees, so use `let` when you *want* the
+compiler to lock a value down:
 
 ```ran
 let limit = 100
-let name = "Alice"
+limit = 200            # error[E0100]: cannot assign to immutable `let` binding `limit`
 ```
 
-### Bare assignment (mutable, shell-style)
+### `let mut` — explicitly mutable
 
-For quick scripts and top-of-file configuration you can skip the keyword entirely —
-write the name, `=`, and a value, just like a shell variable. This declares a mutable
-binding:
+`let mut` is the explicit "this is mutable" form (same effect as `var`, but spells out
+the intent). Handy when reviewing code where mutability matters:
+
+```ran
+let mut counter = 0
+counter = counter + 1
+```
+
+### Bare assignment (shell-style)
+
+You can also skip the keyword entirely — a bare `name = value` declares a mutable
+binding, just like a shell variable. Great for top-of-file config:
 
 ```ran
 port = 8080
 host = "0.0.0.0"
-total = total + 1
 ```
 
 ### Which should I use?
 
-- Use **`var`** for anything you will reassign (loop counters, accumulators, state).
-- Use **`let`** for values that must stay constant — the checker enforces it.
-- Use **bare `name = value`** for top-level config and quick one-off scripts.
+- **`var`** — default; you don't need to reason about mutability.
+- **`let`** — when a value must stay constant (the checker enforces it).
+- **`let mut`** — when you want to *document* that a binding is intentionally mutable.
+- **bare `name = value`** — quick scripts and top-level config.
 
-> Coming from Rust? `var x` replaces `let mut x`, and `let x` stays immutable. The
-> older `let mut x = …` still works, but `var x = …` is the preferred, lighter form.
+> Coming from Rust? `let x` stays immutable (and is now enforced), `let mut x` stays
+> mutable, and `var x` is a lighter everyday alternative to `let mut`.
 
 ## The built-in types
 
@@ -58,6 +71,14 @@ total = total + 1
 | `bool` | `true`, `false` | Boolean |
 | array | `[1, 2, 3]` | Ordered list of values |
 | map | created with `map()` | Key/value dictionary |
+
+> **One `int`, no size juggling.** Unlike C/Rust/Go, you never pick `int8`/`int16`/
+> `int32`/`int64` — there is just `int`. It is a 64-bit signed integer with **overflow
+> protection**: an operation that would exceed the range stops with `error[E1010]`
+> instead of silently wrapping (safer than shell, which wraps quietly). When you need
+> values beyond 64 bits or exact fractional math (money, accounting), use `decimal`,
+> which is exact and arbitrary-scale. (A future arbitrary-precision integer mode is on
+> the roadmap; it is kept separate so the common `int` path stays native-fast.)
 
 Check any value's type at runtime with `typeof`:
 

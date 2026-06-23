@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.9 — `let` is enforced immutable (E0100)
+
+Backward-compatible in practice (nothing in the test suite or `bootstrap/*.ran`
+reassigns a `let`). Ran's three declaration forms now have a clear contract. Summary in
+the root [`CHANGELOG.md`](../CHANGELOG.md).
+
+- **`let x = …`** immutable — reassigning it is a hard `error[E0100]` (with location +
+  fix hint), in every mode.
+- **`let mut x = …`** explicitly mutable; **`var x = …`** flexible mutable (everyday
+  form); bare **`x = …`** shell-style mutable.
+- Parameters, `for` variables, and `match` bindings stay freely assignable — only an
+  explicit `let` is locked (`Binding.let_locked`).
+- Documents the single `int` type (no size variants; 64-bit + `E1010` overflow
+  protection; `decimal` for exact/large values).
+
 ## 0.3.8 — Lighter syntax: `var` (Go-style mutable)
 
 Backward-compatible. The everyday mutable declaration is now **`var x = …`** (Go-style);

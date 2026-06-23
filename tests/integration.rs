@@ -43,6 +43,35 @@ fn code(o: &Output) -> i32 {
 }
 
 #[test]
+fn let_is_immutable_var_is_mutable() {
+    // Reassigning a `let` binding is the hard error E0100 (even in default mode).
+    let out = run(r#"
+fn main() {
+    let x = 5
+    x = 6
+    echo "$x"
+}
+"#);
+    assert_ne!(code(&out), 0, "reassigning a `let` must fail");
+    assert!(stderr(&out).contains("E0100"), "stderr: {}", stderr(&out));
+
+    // `var` and `let mut` allow reassignment; params too.
+    let ok = run(r#"
+fn bump(n: int) -> int { n = n + 1; return n }
+fn main() {
+    var a = 1
+    a = a + 1
+    let mut b = 10
+    b = b + 1
+    let c = bump(7)
+    echo "$a $b $c"
+}
+"#);
+    assert_eq!(code(&ok), 0, "stderr: {}", stderr(&ok));
+    assert_eq!(stdout(&ok).trim(), "2 11 8");
+}
+
+#[test]
 fn var_keyword_is_mutable_go_style() {
     // `var` (Go-style) declares a mutable binding — lighter than `let mut`.
     // `let` is the immutable form; a bare `x = ...` also declares/assigns.
