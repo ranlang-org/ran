@@ -1,50 +1,51 @@
 # Variables & Types
 
-Ran gives you two ways to declare variables: a relaxed bash style and an explicit
-`let` style. You can mix them freely.
+Ran keeps variable declarations light. There are three forms — pick whichever reads
+best; you can mix them freely.
 
 ## Declaring variables
 
-### Bash-style (mutable, type inferred)
+### `var` — mutable (recommended, Go-style)
 
-Write the name, an `=`, and a value. No spaces around the `=`, just like in shell
-scripts.
+Use `var` when a value will change. It is the everyday form and reads cleanly:
 
 ```ran
-name="Alice"
-age=25
-pi=3.14
-active=true
+var total = 0
+var name = "Alice"
+var price: decimal = dec("19.99")   # optional type annotation
+total = total + 5                   # reassign freely
 ```
 
-Bash-style variables are mutable and their type is inferred from the value. They are
-great for configuration at the top of a file.
+### `let` — immutable
 
-### `let` binding
+Use `let` for a value that should never change after it is set. (Reassigning a `let`
+binding is reported by the strict analyzer — `let` means "constant".)
 
 ```ran
+let limit = 100
 let name = "Alice"
-let age = 25
 ```
 
-A plain `let` binding is intended for values that do not change.
+### Bare assignment (mutable, shell-style)
 
-### `let mut` (reassignable)
-
-When you need to change a value later, use `let mut`:
+For quick scripts and top-of-file configuration you can skip the keyword entirely —
+write the name, `=`, and a value, just like a shell variable. This declares a mutable
+binding:
 
 ```ran
-let mut counter = 0
-counter = counter + 1
-counter = counter + 1
-echo "Counter: $counter"   # Counter: 2
+port = 8080
+host = "0.0.0.0"
+total = total + 1
 ```
 
 ### Which should I use?
 
-- Use **bash-style** (`port=8080`) for top-level config and quick scripts.
-- Use **`let`** for values that should stay constant.
-- Use **`let mut`** when you genuinely need to reassign (loop counters, accumulators).
+- Use **`var`** for anything you will reassign (loop counters, accumulators, state).
+- Use **`let`** for values that must stay constant — the checker enforces it.
+- Use **bare `name = value`** for top-level config and quick one-off scripts.
+
+> Coming from Rust? `var x` replaces `let mut x`, and `let x` stays immutable. The
+> older `let mut x = …` still works, but `var x = …` is the preferred, lighter form.
 
 ## The built-in types
 
@@ -53,6 +54,7 @@ echo "Counter: $counter"   # Counter: 2
 | `int` | `42`, `-7` | 64-bit signed integer (i64) |
 | `float` | `3.14`, `-0.5` | 64-bit floating point (f64) |
 | `str` | `"hello"` | UTF-8 text string |
+| `decimal` | `dec("19.99")` | Exact base-10 fixed-point (money/business math) |
 | `bool` | `true`, `false` | Boolean |
 | array | `[1, 2, 3]` | Ordered list of values |
 | map | created with `map()` | Key/value dictionary |

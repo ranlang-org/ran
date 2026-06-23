@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.8 — Lighter syntax: `var` (Go-style mutable)
+
+Backward-compatible. The everyday mutable declaration is now **`var x = …`** (Go-style);
+**`let x = …`** is the immutable form; a bare **`x = …`** still declares/assigns a
+mutable binding (shell-style). `let mut x = …` keeps working. Summary in the root
+[`CHANGELOG.md`](../CHANGELOG.md).
+
+- `var name [: Type] = value` lowers identically on the interpreter, the bytecode VM,
+  and native AOT codegen. Replaces the heavier `let mut`; `let` stays immutable.
+- Docs updated (`02-variables-types.md`) with the `var`/`let`/bare-`=` guidance and a
+  note for users coming from Rust.
+
 ## 0.3.7 — Interpreter ~3× faster (build the runtime for speed)
 
 Backward-compatible (identical behavior). The release profile was optimizing the `ran`

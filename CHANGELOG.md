@@ -11,12 +11,29 @@ the current in-progress work.
 
 ## [Unreleased]
 
-Next (native track): the native HTTP **server** (needs a runtime request-context
-mechanism), then `concurrency` (`spawn`/channels via pthreads). `crypto` stays a thin
-FFI bridge to OpenSSL. Self-hosting track: `bootstrap/codegen.ran` → the `ranc` CLI →
-the Stage A→D bootstrap fixed point that defines 1.0.0. Also planned: extending the
-bytecode VM to cover `for`-range/`while`/interpolation so the interpreter path stops
-falling back to the (slower) tree-walker, and a documented low-level/`unsafe` memory API.
+Next: continuing the language-ergonomics + strictness track — enforce `let`
+immutability and add Rust-style unused-variable / unused-import diagnostics (request
+to make the analyzer "super strict"); mature the COBOL-grade business-logic stdlib
+beyond decimal; a beginner-friendly safe pointer/`unsafe` memory model; widen the
+bytecode VM so the interpreter path stops falling back to the tree-walker; and the
+self-hosting `bootstrap/codegen.ran` → `ranc` → fixed point toward 1.0.0.
+
+## [0.3.8] — Lighter syntax: `var` (Go-style mutable)
+
+Backward-compatible. Variable declarations are now lighter to read and write. The
+everyday mutable form is **`var x = …`** (Go-style); **`let x = …`** is the immutable
+form; and a bare **`x = …`** still declares/assigns a mutable binding (shell-style).
+The older `let mut x = …` keeps working, but `var` replaces its most common use.
+
+### Added — the `var` keyword
+
+- `var name [: Type] = value` declares a mutable binding (sugar for `let mut`). Works
+  identically across the interpreter, the bytecode VM, and native AOT codegen.
+- Docs updated (`02-variables-types.md`): `var` (mutable, recommended) vs `let`
+  (immutable) vs bare `name = value` (mutable, shell-style), with a note for users
+  coming from Rust (`var x` replaces `let mut x`).
+- Rationale: `let mut`/`let` (Rust-derived) read as heavy; `var`/`let` (Go/Swift-like)
+  is cleaner and easier to learn, matching Ran's "easy to read and learn" goal.
 
 ## [0.3.7] — Interpreter ~3× faster (build the runtime for speed)
 

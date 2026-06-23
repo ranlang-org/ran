@@ -299,6 +299,7 @@ impl Lexer {
             "fn" => TokenKind::Fn,
             "let" => TokenKind::Let,
             "mut" => TokenKind::Mut,
+            "var" => TokenKind::Var,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "for" => TokenKind::For,

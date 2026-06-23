@@ -107,6 +107,7 @@ impl Parser {
                 }
             }
             TokenKind::Let => Some(self.parse_let_decl()),
+            TokenKind::Var => Some(self.parse_var_decl()),
             TokenKind::Struct => Some(self.parse_struct_decl(false)),
             TokenKind::Enum => Some(self.parse_enum_decl(false)),
             TokenKind::Impl => Some(self.parse_impl_block()),
@@ -216,6 +217,30 @@ impl Parser {
         Statement::VarDecl {
             name,
             mutable,
+            type_annotation,
+            value,
+        }
+    }
+
+    /// `var name [: Type] = value` — Go-style mutable declaration. Equivalent to
+    /// `let mut name = value` but lighter to read/write. Immutability uses `let`.
+    fn parse_var_decl(&mut self) -> Statement {
+        self.advance(); // consume 'var'
+        let name = self.consume_identifier();
+
+        let type_annotation = if self.current_kind() == TokenKind::Colon {
+            self.advance();
+            Some(self.parse_type_expr())
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::Assign);
+        let value = self.parse_expression();
+
+        Statement::VarDecl {
+            name,
+            mutable: true,
             type_annotation,
             value,
         }

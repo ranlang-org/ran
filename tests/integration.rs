@@ -43,6 +43,27 @@ fn code(o: &Output) -> i32 {
 }
 
 #[test]
+fn var_keyword_is_mutable_go_style() {
+    // `var` (Go-style) declares a mutable binding — lighter than `let mut`.
+    // `let` is the immutable form; a bare `x = ...` also declares/assigns.
+    let out = run(r#"
+fn main() {
+    var total = 0
+    let limit = 100
+    count = 0
+    for n in range(1, 11) {
+        total = total + n
+        count = count + 1
+    }
+    var label: str = "sum"
+    echo "$label = $total over $count (limit $limit)"
+}
+"#);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "sum = 55 over 10 (limit 100)");
+}
+
+#[test]
 fn return_inside_loop_exits_function() {
     let out = run(r#"
 fn first_even(n: int) -> int {

@@ -28,6 +28,8 @@ pub enum TokenKind {
     Fn,
     Let,
     Mut,
+    /// `var` — Go-style mutable declaration (sugar for `let mut`).
+    Var,
     If,
     Else,
     For,
